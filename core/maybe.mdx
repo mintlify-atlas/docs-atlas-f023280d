@@ -1,0 +1,378 @@
+---
+title: 'Maybe: nullable values without null errors'
+description: 'Represent presence and absence explicitly with Some<T> and None. Eliminate null reference errors by making optionality visible in the type system.'
+keywords: ['maybe', 'some', 'none', 'optional', 'nullable', 'functional']
+---
+
+`Maybe<T>` is a discriminated union that represents a value that may or may not be present. `Some<T>` holds a value; `None` signals absence. Unlike `T | null | undefined`, a `Maybe<T>` is always a structured object — you can map over it, chain operations, and extract a default without branching on `null` checks throughout your code.
+
+## Types
+
+`Some<T>` holds a present value. Its shape is:
+
+```typescript
+{ ok: true; value: T }
+```
+
+`None` signals absence. Its shape is:
+
+```typescript
+{ ok: false }
+```
+
+<Note>
+`none()` returns a singleton. All `None` values are the same instance, making identity comparisons (`===`) safe.
+</Note>
+
+Together they form `Maybe<T>`:
+
+```typescript
+type Maybe<T> = Some<T> | None;
+```
+
+---
+
+## Constructors
+
+### `some(value)`
+
+Creates a `Some<T>` wrapping a non-null, non-undefined value.
+
+```typescript
+import { some } from '@deessejs/fp';
+
+const result = some(42);
+// { ok: true, value: 42 }
+```
+
+<Warning>
+`some` accepts `NonNullable<T>`. If you have a value that might be `null` or `undefined`, use `fromNullable` instead — it handles both cases automatically.
+</Warning>
+
+### `none()`
+
+Creates (or returns the shared) `None` value.
+
+```typescript
+import { none } from '@deessejs/fp';
+
+const absent = none();
+// { ok: false }
+```
+
+### `fromNullable(value)`
+
+Converts any nullable value into a `Maybe`. Returns `Some(value)` for anything other than `null` or `undefined`, and `None` otherwise.
+
+```typescript
+import { fromNullable } from '@deessejs/fp';
+
+fromNullable(42);        // Some(42)
+fromNullable(null);      // None
+fromNullable(undefined); // None
+
+// Falsy-but-valid values are Some, not None
+fromNullable(0);         // Some(0)
+fromNullable('');        // Some('')
+fromNullable(false);     // Some(false)
+```
+
+<Tip>
+Use `fromNullable` at the boundary where external data enters your system — array `.find()`, object property access, environment variables — to immediately promote nullable values into `Maybe`.
+</Tip>
+
+---
+
+## Type guards
+
+### `isSome(maybe)`
+
+Narrows `Maybe<T>` to `Some<T>`.
+
+```typescript
+import { some, isSome } from '@deessejs/fp';
+
+const m = some(42);
+
+if (isSome(m)) {
+  console.log(m.value); // TypeScript knows: m is Some<number>
+}
+```
+
+### `isNone(maybe)`
+
+Narrows `Maybe<T>` to `None`.
+
+```typescript
+import { none, isNone } from '@deessejs/fp';
+
+const m = none();
+
+if (isNone(m)) {
+  // TypeScript knows: m is None
+  console.log('absent');
+}
+```
+
+---
+
+## Transformations
+
+### `mapMaybe(maybe, fn)`
+
+Applies `fn` to the value inside `Some`. Returns `None` unchanged.
+
+```typescript
+import { some, none, mapMaybe } from '@deessejs/fp';
+
+mapMaybe(some(2), x => x * 2);  // Some(4)
+mapMaybe(none(), x => x * 2);   // None
+```
+
+### `flatMapMaybe(maybe, fn)`
+
+Chains operations that themselves return a `Maybe`. Use this when your transformation can also produce absence.
+
+```typescript
+import { some, none, flatMapMaybe, Maybe } from '@deessejs/fp';
+
+const parsePositive = (n: number): Maybe<number> =>
+  n > 0 ? some(n) : none();
+
+flatMapMaybe(some(5), parsePositive);   // Some(5)
+flatMapMaybe(some(-1), parsePositive);  // None
+flatMapMaybe(none(), parsePositive);    // None
+```
+
+### `flattenMaybe(maybe)`
+
+Flattens a `Maybe<Maybe<T>>` into `Maybe<T>`.
+
+```typescript
+import { some, none, flattenMaybe } from '@deessejs/fp';
+
+flattenMaybe(some(some(42))); // Some(42)
+flattenMaybe(some(none()));   // None
+flattenMaybe(none());         // None
+```
+
+### `filterMaybe(maybe, predicate)`
+
+Returns `None` if the predicate returns `false` for the value in `Some`. Passes `None` through unchanged.
+
+```typescript
+import { some, none, filterMaybe } from '@deessejs/fp';
+
+filterMaybe(some(25), age => age >= 18); // Some(25)
+filterMaybe(some(16), age => age >= 18); // None
+filterMaybe(none(), age => age >= 18);   // None
+```
+
+---
+
+## Extraction
+
+### `getOrElseMaybe(maybe, defaultValue)`
+
+Returns the value if `Some`, or `defaultValue` if `None`.
+
+```typescript
+import { some, none, getOrElseMaybe } from '@deessejs/fp';
+
+getOrElseMaybe(some(42), 0); // 42
+getOrElseMaybe(none(), 0);   // 0
+```
+
+### `getOrComputeMaybe(maybe, fn)`
+
+Returns the value if `Some`, or calls `fn` to compute a fallback if `None`. The function is only invoked on absence.
+
+```typescript
+import { some, none, getOrComputeMaybe } from '@deessejs/fp';
+
+getOrComputeMaybe(some(42), () => loadDefault());
+// 42  — loadDefault() is never called
+
+getOrComputeMaybe(none(), () => loadDefault());
+// result of loadDefault()
+```
+
+---
+
+## Side effects
+
+### `tapMaybe(maybe, fn)`
+
+Runs `fn` on the value when `Some`, then returns the original `Maybe` unchanged.
+
+```typescript
+import { some, none, tapMaybe } from '@deessejs/fp';
+
+tapMaybe(some(42), v => console.log('value:', v));
+// Logs: "value: 42"  |  Returns: Some(42)
+
+tapMaybe(none(), v => console.log('value:', v));
+// Nothing logged     |  Returns: None
+```
+
+---
+
+## Pattern matching
+
+### `matchMaybe(maybe, someFn, noneFn)`
+
+Exhaustively handles both `Some` and `None` cases, returning a single unified value.
+
+```typescript
+import { some, none, matchMaybe } from '@deessejs/fp';
+
+matchMaybe(
+  some(42),
+  value => `Found: ${value}`,
+  () => 'Not found'
+);
+// "Found: 42"
+
+matchMaybe(
+  none(),
+  value => value * 2,
+  () => -1
+);
+// -1
+```
+
+---
+
+## Conversions
+
+### `toNullableMaybe(maybe)`
+
+Returns the value if `Some`, or `null` if `None`.
+
+```typescript
+import { some, none, toNullableMaybe } from '@deessejs/fp';
+
+toNullableMaybe(some(42)); // 42
+toNullableMaybe(none());   // null
+```
+
+### `toUndefinedMaybe(maybe)`
+
+Returns the value if `Some`, or `undefined` if `None`.
+
+```typescript
+import { some, none, toUndefinedMaybe } from '@deessejs/fp';
+
+toUndefinedMaybe(some(42)); // 42
+toUndefinedMaybe(none());   // undefined
+```
+
+### `toResultMaybe(maybe, onNone)`
+
+Converts a `Maybe<T>` into a `Result<T, E>`. Calls `onNone` to produce the error when the value is absent.
+
+```typescript
+import { some, none, toResultMaybe } from '@deessejs/fp';
+import { error } from '@deessejs/fp';
+
+const NotFound = error({ name: 'NotFound', message: () => 'Not found' });
+
+toResultMaybe(some(42), () => NotFound());   // Ok(42)
+toResultMaybe(none(), () => NotFound());     // Err(NotFound)
+```
+
+---
+
+## Combinators
+
+### `allMaybe(...maybes)`
+
+Combines multiple `Maybe` values into a single `Maybe` of a tuple. Returns `None` if any input is `None`.
+
+```typescript
+import { some, none, allMaybe } from '@deessejs/fp';
+
+allMaybe(some(1), some('a'), some(true));
+// Some([1, 'a', true])
+
+allMaybe(some(1), none(), some(true));
+// None
+```
+
+### `equalsMaybe(a, b)`
+
+Returns `true` if both are `None`, or both are `Some` with equal values (using `===`).
+
+```typescript
+import { some, none, equalsMaybe } from '@deessejs/fp';
+
+equalsMaybe(some(42), some(42)); // true
+equalsMaybe(some(42), some(0));  // false
+equalsMaybe(none(), none());     // true
+equalsMaybe(some(42), none());   // false
+```
+
+### `equalsWithMaybe(a, b, comparator)`
+
+Like `equalsMaybe` but uses a custom comparator for the `Some` branch.
+
+```typescript
+import { some, equalsWithMaybe } from '@deessejs/fp';
+
+equalsWithMaybe(
+  some({ id: 1 }),
+  some({ id: 1 }),
+  (a, b) => a.id === b.id
+);
+// true
+```
+
+---
+
+## Method chaining
+
+Every `Some` and `None` object exposes the same operations as methods, enabling a fluent style.
+
+```typescript
+import { some, none } from '@deessejs/fp';
+
+const result = some(5)
+  .map(x => x * 2)                              // Some(10)
+  .filter(x => x > 8)                           // Some(10)
+  .flatMap(x => x === 10 ? none() : some(x));   // None
+```
+
+When the chain reaches a `None`, all subsequent `map`, `filter`, and `flatMap` calls are no-ops.
+
+---
+
+## Maybe vs Result comparison
+
+| Situation | Use |
+|---|---|
+| A value may or may not exist | `Maybe<T>` |
+| An operation can fail with an error | `Result<T, E>` |
+| Finding an item in a list | `Maybe<T>` |
+| Making a network request | `Result<T, NetworkError>` |
+| Reading optional config | `Maybe<T>` |
+| Validating user input | `Result<T, ValidationError>` |
+
+<Tip>
+When you need to signal **why** something is absent (e.g. "not found" vs "unauthorized"), use `Result` instead. `Maybe` represents the presence/absence of a value, not the reason for absence.
+</Tip>
+
+---
+
+## Related
+
+<CardGroup cols={3}>
+  <Card title="Result" icon="circle-check" href="/core/result">
+    Type-safe error handling in TypeScript.
+  </Card>
+  <Card title="Try" icon="shield-halved" href="/core/try">
+    Wrap throwing functions safely.
+  </Card>
+  <Card title="AsyncResult" icon="bolt" href="/core/async-result">
+    Async error handling without try/catch.
+  </Card>
+</CardGroup>

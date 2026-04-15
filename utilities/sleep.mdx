@@ -1,0 +1,304 @@
+---
+title: "Sleep, timeout, and delay utilities for async code"
+description: "Promise-based sleep, cancellable delays with AbortSignal, timeout wrappers with elapsed tracking, and jitter helpers for rate limiting and retry backoff."
+---
+
+Delays are the connective tissue of resilient async code. Whether you're spacing out API calls to avoid rate limits, adding a timeout guard to an external request, or building a cancellable wait inside a retry loop, `@deessejs/fp` provides composable, type-safe primitives for each case.
+
+## API reference
+
+### `sleep(ms)` — simple delay
+
+Returns a `Promise<void>` that resolves after `ms` milliseconds. Optionally accepts a `SleepOptions` object to add jitter.
+
+<ParamField body="ms" type="number" required>
+  Delay in milliseconds. `0` resolves on the next event loop tick.
+</ParamField>
+
+<ParamField body="options" type="SleepOptions">
+  Optional. Set `jitter: true` for ±50% variance, or `jitter: 0.2` for ±20%.
+</ParamField>
+
+```typescript
+import { sleep } from '@deessejs/fp';
+
+await sleep(1000);        // 1 second
+await sleep(500);         // 500ms
+await sleep(0);           // next tick
+
+// With jitter — actual delay is 750ms–1250ms
+await sleep(1000, { jitter: 0.25 });
+```
+
+### `withTimeout(promise, ms, options)` — add a timeout to any promise
+
+Races a promise (or a function returning a promise) against a timer. If the timer fires first, rejects with a `TimeoutError`. Automatically clears the timer when the promise settles.
+
+<ParamField body="promise" type="Promise<T> | (() => Promise<T>) | ((signal: AbortSignal) => Promise<T>)" required>
+  The operation to time-limit. Pass a factory function (no arguments) to defer execution, or a signal-aware function `(signal: AbortSignal) => Promise<T>` to enable automatic abort on timeout.
+</ParamField>
+
+<ParamField body="ms" type="number" required>
+  Timeout duration in milliseconds.
+</ParamField>
+
+<ParamField body="options" type="TimeoutOptions">
+  Optional. Customize the error message, name, and elapsed-time tracking.
+</ParamField>
+
+<Tabs>
+  <Tab title="Promise">
+    ```typescript
+    import { withTimeout } from '@deessejs/fp';
+
+    const data = await withTimeout(fetch('/api/data'), 5000);
+    // Resolves with Response, or throws TimeoutError after 5s
+    ```
+  </Tab>
+  <Tab title="Factory function">
+    ```typescript
+    // Deferred — promise is not created until withTimeout starts the timer
+    const data = await withTimeout(() => fetch('/api/data'), 5000);
+    ```
+  </Tab>
+  <Tab title="Signal injection">
+    ```typescript
+    // Pass signal into your async operation for cooperative cancellation
+    const { promise, cleanup } = withTimeout(
+      (signal: AbortSignal) => fetch('/api/data', { signal }),
+      5000,
+    ) as TimeoutResult<Response>;
+
+    try {
+      const res = await promise;
+    } finally {
+      cleanup(); // always release the timer
+    }
+    ```
+  </Tab>
+</Tabs>
+
+### `TimeoutOptions` interface
+
+```typescript
+interface TimeoutOptions {
+  /** Error message on timeout. Default: "Timeout after {elapsed}ms" */
+  message?: string;
+
+  /** Error name. Default: "TIMEOUT" */
+  name?: string;
+
+  /** Include elapsed ms on the error object. Default: true */
+  includeElapsed?: boolean;
+
+  /** AbortController to abort the underlying operation on timeout. */
+  abortController?: AbortController;
+}
+```
+
+### `TimeoutError` structure
+
+```typescript
+type TimeoutError = Error & {
+  name: string;     // default: "TIMEOUT"
+  timeout: number;  // the ms limit you passed
+  elapsed?: number; // how long it actually ran before timing out
+};
+```
+
+Catching and inspecting a `TimeoutError`:
+
+```typescript
+import { withTimeout } from '@deessejs/fp';
+
+try {
+  await withTimeout(slowOperation(), 3000, { name: 'SLOW_OP' });
+} catch (err) {
+  const e = err as import('@deessejs/fp').TimeoutError;
+  if (e.name === 'SLOW_OP') {
+    console.error(`Timed out after ${e.elapsed}ms (limit: ${e.timeout}ms)`);
+  }
+}
+```
+
+### `sleepWithSignal(ms, signal)` — cancellable sleep
+
+A sleep that rejects early when an `AbortSignal` fires. Useful inside retry loops or test harnesses where you need to abort a waiting period without waiting for it to expire.
+
+<ParamField body="ms" type="number" required>
+  Maximum sleep duration in milliseconds.
+</ParamField>
+
+<ParamField body="signal" type="AbortSignal | SleepOptions & { signal?: AbortSignal }" required>
+  Either an `AbortSignal` directly (legacy), or an options object with an optional `signal` field and optional `jitter`.
+</ParamField>
+
+```typescript
+import { sleepWithSignal } from '@deessejs/fp';
+
+const controller = new AbortController();
+
+// Cancel after 800ms even though we asked for 5 seconds
+setTimeout(() => controller.abort(), 800);
+
+try {
+  await sleepWithSignal(5000, controller.signal);
+  console.log('Done');
+} catch (err) {
+  console.log(err.message); // 'Sleep aborted'
+}
+```
+
+### `addJitter(ms, jitter?)` — randomize a delay value
+
+Applies a variance multiplier to a base delay and returns a new number. Does not sleep — use the return value as the argument to `sleep`.
+
+<ParamField body="ms" type="number" required>
+  Base delay in milliseconds.
+</ParamField>
+
+<ParamField body="jitter" type="boolean | number">
+  `true` = ±50% variance (0.5× to 1.5×). A number between 0 and 1 sets a custom range: `0.2` = ±20% (0.8× to 1.2×). Negative values or `false` return `ms` unchanged.
+</ParamField>
+
+```typescript
+import { addJitter, sleep } from '@deessejs/fp';
+
+const delay = addJitter(1000, true);  // e.g., 732 or 1418
+await sleep(delay);
+
+// Custom variance
+const gentle = addJitter(1000, 0.1); // 900–1100ms
+```
+
+## Real-world examples
+
+### Rate-limiting outbound requests
+
+```typescript
+import { sleep } from '@deessejs/fp';
+
+const rateLimitedBatch = async <T>(
+  items: T[],
+  handler: (item: T) => Promise<void>,
+  delayMs = 100,
+) => {
+  for (const item of items) {
+    await handler(item);
+    await sleep(delayMs); // pause between each call
+  }
+};
+
+await rateLimitedBatch(userIds, sendWelcomeEmail, 150);
+```
+
+### API call with a hard timeout
+
+```typescript
+import { withTimeout } from '@deessejs/fp';
+
+const fetchWithDeadline = async <T>(url: string, ms: number): Promise<T> => {
+  const res = await withTimeout(fetch(url), ms, {
+    message: `${url} did not respond within ${ms}ms`,
+    name: 'API_TIMEOUT',
+  });
+
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+};
+
+const user = await fetchWithDeadline<User>('/api/users/42', 3000);
+```
+
+### Retry with cancellable backoff
+
+```typescript
+import { sleepWithSignal, addJitter } from '@deessejs/fp';
+
+const retryWithCancel = async <T>(
+  fn: () => Promise<T>,
+  { attempts = 3, delay = 1000, signal }: { attempts?: number; delay?: number; signal?: AbortSignal },
+): Promise<T> => {
+  let lastErr: Error;
+
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err instanceof Error ? err : new Error(String(err));
+      if (i < attempts) {
+        const wait = addJitter(delay * Math.pow(2, i - 1), true);
+        if (signal) {
+          await sleepWithSignal(wait, signal);
+        } else {
+          await sleepWithSignal(wait);
+        }
+      }
+    }
+  }
+
+  throw lastErr!;
+};
+```
+
+<Tip>
+For production retry logic, use `retryAsync` from the Retry module instead — it provides all of the above plus backoff strategies, `maxDelay`, `predicate`, and `onRetry` in a single composable API.
+</Tip>
+
+### Graceful timeout with AbortController cleanup
+
+```typescript
+import { withTimeout } from '@deessejs/fp';
+
+const fetchWithAbort = async (url: string) => {
+  const controller = new AbortController();
+
+  // Pass the controller so fetch is aborted when timeout fires
+  const result = await withTimeout(
+    (signal: AbortSignal) => fetch(url, { signal }),
+    5000,
+    { abortController: controller },
+  );
+
+  return result;
+};
+```
+
+### Polling with sleep
+
+```typescript
+import { sleep } from '@deessejs/fp';
+
+const pollUntil = async <T>(
+  check: () => Promise<T | null>,
+  { intervalMs = 500, timeoutMs = 30_000 } = {},
+): Promise<T> => {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const result = await check();
+    if (result !== null) return result;
+    await sleep(intervalMs);
+  }
+
+  throw new Error(`Polling timed out after ${timeoutMs}ms`);
+};
+
+// Wait for a job to complete
+const job = await pollUntil(() => api.getJobStatus(jobId).then(j => j.done ? j : null));
+```
+
+<CardGroup cols={2}>
+  <Card title="Retry" href="/utilities/retry">
+    Automatic retry with backoff — uses sleep internally
+  </Card>
+  <Card title="Pipe & Flow" href="/utilities/pipe-flow">
+    Compose sleep and timeout into async pipelines
+  </Card>
+  <Card title="AsyncResult" href="/core/async-result">
+    Async operations with structured error handling
+  </Card>
+  <Card title="Async patterns" href="/guides/async-patterns">
+    Combining timeouts, retries, and cancellation
+  </Card>
+</CardGroup>

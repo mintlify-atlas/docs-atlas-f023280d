@@ -1,0 +1,266 @@
+---
+title: "Convert between Result, Maybe, and nullable types"
+description: "Bridge Result, Maybe, and raw nullable values with type-safe conversion helpers that preserve or explicitly discard error information at integration boundaries."
+---
+
+Different parts of an application speak different languages. A database layer might return `T | null`. A legacy function might use `Maybe<T>`. Your domain logic uses `Result<T, E>` with typed errors. The conversions module provides the glue: a small set of functions that move values between these representations without losing type safety and — where information is necessarily discarded — making that trade-off explicit.
+
+## Conversion table
+
+| From | To | Function |
+|------|----|----------|
+| `Maybe<T>` | `Result<T, E>` | `toResult(maybe, onNone)` / `fromMaybe` |
+| `Result<T, E>` | `Maybe<T>` | `toMaybeFromResult(result)` / `fromResult` |
+| `T \| null \| undefined` | `Result<T, E>` | `resultFromNullable(value, onNull)` |
+| `() => T` (may throw) | `Result<T, Error>` | `resultFromThrowable(fn)` |
+
+## API reference
+
+### `toResult(maybe, onNone)` — Maybe → Result
+
+Converts `Maybe<T>` to `Result<T, E>`. When the `Maybe` is `None`, the `onNone` factory is called to produce the error. The alias `fromMaybe` is identical.
+
+<ParamField body="maybe" type="Maybe<T>" required>
+  The `Maybe` value to convert. `Some<T>` maps to `Ok<T>`; `None` maps to `Err<E>`.
+</ParamField>
+
+<ParamField body="onNone" type="() => E" required>
+  Error factory called only when the `Maybe` is `None`. Use a function (not a value) so the error object is only created when needed.
+</ParamField>
+
+```typescript
+import { toResult, fromMaybe, some, none } from '@deessejs/fp';
+import { error } from '@deessejs/fp';
+import { z } from 'zod';
+
+const NotFoundError = error({
+  name: 'NotFoundError',
+  schema: z.object({ id: z.number() }),
+});
+
+const maybeUser = findUserById(1); // Maybe<User>
+
+const result = toResult(maybeUser, () => NotFoundError({ id: 1 }));
+// Ok<User>  when maybeUser is Some
+// Err<NotFoundError>  when maybeUser is None
+
+// fromMaybe is an alias — identical behavior
+const same = fromMaybe(maybeUser, () => NotFoundError({ id: 1 }));
+```
+
+### `toMaybeFromResult(result)` — Result → Maybe
+
+Converts `Result<T, E>` to `Maybe<T>`. An `Ok<T>` becomes `Some<T>`; an `Err` becomes `None`. Error information is lost in this direction. The alias `fromResult` is identical.
+
+<ParamField body="result" type="Result<T, E>" required>
+  The `Result` to convert. Error information is intentionally discarded.
+</ParamField>
+
+<Warning>
+`toMaybeFromResult` discards the error. Handle the error (log it, re-raise it, record metrics) **before** converting if you need it downstream.
+</Warning>
+
+```typescript
+import { toMaybeFromResult, fromResult } from '@deessejs/fp';
+
+const result = fetchConfig(); // Result<Config, ConfigError>
+
+// Discard error — only care whether a config exists
+const maybeConfig = toMaybeFromResult(result);
+// Some<Config>  when result is Ok
+// None          when result is Err (error is gone)
+```
+
+### `resultFromNullable(value, onNull)` — nullable → Result
+
+Converts `T | null | undefined` directly to `Result<NonNullable<T>, E>` in one step. A non-null value becomes `Ok<NonNullable<T>>`; `null` or `undefined` calls `onNull` for the error.
+
+<ParamField body="value" type="T | null | undefined" required>
+  The raw value that may be null or undefined.
+</ParamField>
+
+<ParamField body="onNull" type="() => E" required>
+  Error factory called when `value` is `null` or `undefined`.
+</ParamField>
+
+```typescript
+import { resultFromNullable } from '@deessejs/fp';
+
+const PortError = error({ name: 'PortError' });
+const UserNotFoundError = error({
+  name: 'UserNotFoundError',
+  schema: z.object({ id: z.string() }),
+});
+
+// From environment variable
+const port = resultFromNullable(
+  process.env.PORT,
+  () => PortError(),
+);
+// Ok<string>   when PORT is set
+// Err<PortError>  when PORT is undefined
+
+// From database lookup
+const user = resultFromNullable(
+  db.users.findById(id),
+  () => UserNotFoundError({ id }),
+);
+```
+
+### `resultFromThrowable(fn)` — throwing function → Result
+
+Wraps a synchronous function that may throw in a `Result`. If the function succeeds, returns `Ok<T>`. If it throws, catches the exception and returns `Err<Error>`.
+
+<ParamField body="fn" type="() => T" required>
+  A zero-argument function to execute. Any thrown value is normalized to a native `Error` if it is not already one.
+</ParamField>
+
+```typescript
+import { resultFromThrowable } from '@deessejs/fp';
+
+// JSON.parse throws on invalid input
+const parsed = resultFromThrowable(() => JSON.parse(rawJson));
+// Ok<unknown>  when JSON is valid
+// Err<Error>   when JSON.parse throws
+
+// Unsafe third-party SDK call
+const token = resultFromThrowable(() => sdk.generateToken(options));
+```
+
+<Tip>
+For **async** throwing functions, use `attemptAsync` from the Try module or `fromPromise` from the AsyncResult module instead.
+</Tip>
+
+## Real-world examples
+
+### Boundary conversion: database null → typed Result
+
+```typescript
+import { resultFromNullable, error } from '@deessejs/fp';
+import { z } from 'zod';
+
+const UserNotFoundError = error({
+  name: 'UserNotFoundError',
+  schema: z.object({ id: z.string().uuid() }),
+});
+
+// Repository — raw DB layer returns T | null
+const findUser = (id: string) =>
+  resultFromNullable(
+    db.query('SELECT * FROM users WHERE id = ?', [id])[0] ?? null,
+    () => UserNotFoundError({ id }),
+  );
+
+// Service — works with Result<User, UserNotFoundError>
+const getProfile = (id: string) =>
+  pipe(
+    findUser(id),
+    mapResult(user => user.profile),
+  );
+```
+
+### Adapting a Maybe-returning legacy function
+
+```typescript
+import { toResult, some, none } from '@deessejs/fp';
+
+// Legacy function returns Maybe<Session>
+declare function getSession(token: string): Maybe<Session>;
+
+const SessionError = error({ name: 'SessionExpiredError' });
+
+const validateSession = (token: string) =>
+  toResult(
+    getSession(token),
+    () => SessionError(),
+  );
+// Result<Session, SessionExpiredError>
+```
+
+### Safely parsing external input
+
+```typescript
+import { resultFromThrowable, pipe } from '@deessejs/fp';
+import { mapResult, flatMapResult } from '@deessejs/fp';
+
+const parseConfig = (raw: string) =>
+  pipe(
+    resultFromThrowable(() => JSON.parse(raw)),
+    flatMapResult(data => validateSchema(data)), // further validation
+  );
+```
+
+### Converting Result to Maybe for optional chaining
+
+```typescript
+import { toMaybeFromResult, getOrElseMaybe } from '@deessejs/fp';
+
+// Only care about presence, not error details
+const username = pipe(
+  fetchUser(id),                  // Result<User, Error>
+  toMaybeFromResult,              // Maybe<User>
+  mapMaybe(u => u.displayName),  // Maybe<string>
+  getOrElseMaybe(() => 'Anonymous'),
+);
+```
+
+## When to convert vs when to stay in one type
+
+<AccordionGroup>
+  <Accordion title="Convert at system boundaries, not in the middle">
+    Keep your domain logic in a single type — usually `Result<T, E>`. Convert at the entry and exit points: when reading from an external source (nullable DB result → `resultFromNullable`) or when handing off to a legacy layer that expects `Maybe`.
+
+    Converting repeatedly in the middle of a pipeline signals that your types aren't aligned. Align them once at the boundary.
+  </Accordion>
+
+  <Accordion title="Use resultFromNullable over a two-step fromNullable + toResult">
+    ```typescript
+    // Two steps — verbose
+    const user = toResult(fromNullable(db.findById(id)), () => NotFoundError({ id }));
+
+    // One step — clearer intent
+    const user = resultFromNullable(db.findById(id), () => NotFoundError({ id }));
+    ```
+  </Accordion>
+
+  <Accordion title="Handle errors before converting to Maybe">
+    ```typescript
+    // Bad: error silently dropped
+    const maybe = toMaybeFromResult(fetchUser(id));
+
+    // Good: explicit before discarding
+    const result = fetchUser(id);
+    if (!result.ok) {
+      logger.error('fetchUser failed', result.error);
+    }
+    const maybe = toMaybeFromResult(result);
+    ```
+  </Accordion>
+
+  <Accordion title="resultFromThrowable is for sync code only">
+    Do not use `resultFromThrowable` with `async` functions — it will not catch async rejections. Use `attemptAsync` or `fromPromise` for async code.
+
+    ```typescript
+    // Wrong: async rejection not caught
+    resultFromThrowable(async () => fetch('/api'));
+
+    // Correct for async
+    const result = await fromPromise(fetch('/api'), mapNetworkError);
+    ```
+  </Accordion>
+</AccordionGroup>
+
+<CardGroup cols={2}>
+  <Card title="Result" href="/core/result">
+    The primary error-handling type in @deessejs/fp
+  </Card>
+  <Card title="Maybe" href="/core/maybe">
+    Optional values without null checks
+  </Card>
+  <Card title="Error system" href="/utilities/error-system">
+    Typed domain errors for structured error information
+  </Card>
+  <Card title="Pipe & Flow" href="/utilities/pipe-flow">
+    Compose conversions into readable pipelines
+  </Card>
+</CardGroup>

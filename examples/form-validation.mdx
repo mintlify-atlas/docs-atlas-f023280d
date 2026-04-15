@@ -1,0 +1,316 @@
+---
+title: "Form validation with Result and error types"
+description: "Learn how to build type-safe form validation using Result, collecting errors per-field or failing fast, with framework-agnostic examples."
+keywords: ["form validation", "Result", "ValidationError", "flatMapResult", "allResult", "type-safe"]
+---
+
+Form validation is one of the most natural fits for `Result`. Each field validator returns either a validated value or a typed error, and you compose them into a full form validator that either fails on the first problem or collects every error at once before returning.
+
+## Define your error type
+
+Start with a discriminated union that captures which field failed and why.
+
+```typescript
+import { Result, ok, err } from '@deessejs/fp';
+
+type ValidationError = {
+  field: string;
+  code: string;
+  message: string;
+};
+```
+
+Using a structured type instead of a plain string lets you drive UI feedback — highlight the right input, show the right message — without any string parsing.
+
+## Write individual field validators
+
+Each validator is a pure function from raw input to `Result<ValidatedValue, ValidationError>`.
+
+```typescript
+const validateName = (name: string): Result<string, ValidationError> => {
+  if (name.length < 2)
+    return err({ field: 'name', code: 'TOO_SHORT', message: 'Name must be at least 2 characters' });
+  if (name.length > 50)
+    return err({ field: 'name', code: 'TOO_LONG', message: 'Name must not exceed 50 characters' });
+  if (!/^[a-zA-Z\s]+$/.test(name))
+    return err({ field: 'name', code: 'INVALID_CHARS', message: 'Name can only contain letters and spaces' });
+  return ok(name);
+};
+
+const validateEmail = (email: string): Result<string, ValidationError> => {
+  if (!email)
+    return err({ field: 'email', code: 'REQUIRED', message: 'Email is required' });
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
+    return err({ field: 'email', code: 'INVALID_FORMAT', message: 'Email format is invalid' });
+  return ok(email);
+};
+
+const validateAge = (age: number): Result<number, ValidationError> => {
+  if (age < 13)
+    return err({ field: 'age', code: 'TOO_YOUNG', message: 'You must be at least 13 years old' });
+  if (age > 120)
+    return err({ field: 'age', code: 'INVALID', message: 'Please enter a valid age' });
+  return ok(age);
+};
+
+const validatePassword = (password: string): Result<string, ValidationError> => {
+  if (password.length < 8)
+    return err({ field: 'password', code: 'TOO_SHORT', message: 'Password must be at least 8 characters' });
+  if (!/[A-Z]/.test(password))
+    return err({ field: 'password', code: 'NO_UPPERCASE', message: 'Password must contain an uppercase letter' });
+  if (!/[0-9]/.test(password))
+    return err({ field: 'password', code: 'NO_NUMBER', message: 'Password must contain a number' });
+  return ok(password);
+};
+```
+
+## Two composition strategies
+
+Depending on your UX, you want one of two behaviors: stop at the first error, or collect every error before showing feedback.
+
+<Tabs>
+  <Tab title="Fail fast (sequential)">
+    Use `flatMapResult` to chain validators. The chain short-circuits on the first `Err` — later validators never run.
+
+    ```typescript
+    import { ok, flatMapResult, Result } from '@deessejs/fp';
+
+    type RegistrationForm = {
+      name: string;
+      email: string;
+      age: number;
+      password: string;
+    };
+
+    const validateForm = (
+      form: RegistrationForm
+    ): Result<RegistrationForm, ValidationError> =>
+      flatMapResult(
+        flatMapResult(
+          flatMapResult(
+            flatMapResult(
+              ok(form),
+              (data) => flatMapResult(validateName(data.name), (name) => ok({ ...data, name }))
+            ),
+            (data) => flatMapResult(validateEmail(data.email), (email) => ok({ ...data, email }))
+          ),
+          (data) => flatMapResult(validateAge(data.age), (age) => ok({ ...data, age }))
+        ),
+        (data) => flatMapResult(validatePassword(data.password), (password) => ok({ ...data, password }))
+      );
+
+    // Usage
+    const result = validateForm({ name: 'X', email: 'bad', age: 10, password: 'weak' });
+    // Err({ field: 'name', code: 'TOO_SHORT', ... }) — stops at first failure
+    ```
+
+    <Tip>This pattern is ideal for wizard-style forms where you validate one step at a time before moving to the next.</Tip>
+  </Tab>
+  <Tab title="Collect all errors">
+    Run every validator independently and accumulate errors. Return `ok` only when the list is empty.
+
+    ```typescript
+    import { ok, err, isErr, Result } from '@deessejs/fp';
+
+    type FormErrors = { errors: ValidationError[] };
+
+    const validateFormAll = (
+      form: RegistrationForm
+    ): Result<RegistrationForm, FormErrors> => {
+      const errors: ValidationError[] = [];
+
+      const nameResult = validateName(form.name);
+      if (isErr(nameResult)) errors.push(nameResult.error);
+
+      const emailResult = validateEmail(form.email);
+      if (isErr(emailResult)) errors.push(emailResult.error);
+
+      const ageResult = validateAge(form.age);
+      if (isErr(ageResult)) errors.push(ageResult.error);
+
+      const passwordResult = validatePassword(form.password);
+      if (isErr(passwordResult)) errors.push(passwordResult.error);
+
+      if (errors.length > 0) return err({ errors });
+      return ok(form);
+    };
+
+    // Usage
+    const result = validateFormAll({ name: 'X', email: 'bad', age: 10, password: 'weak' });
+    // Err({ errors: [{ field: 'name', ... }, { field: 'email', ... }, ...] })
+    ```
+
+    <Tip>This is the right strategy for single-page forms where you want to highlight every invalid field simultaneously.</Tip>
+  </Tab>
+</Tabs>
+
+## Optional fields with conditional validation
+
+For optional fields, only validate when a value is present.
+
+```typescript
+type UserProfile = {
+  name: string;
+  email: string;
+  age: number;
+  website?: string;
+};
+
+const validateProfile = (
+  profile: UserProfile
+): Result<UserProfile, ValidationError> => {
+  const base = flatMapResult(
+    flatMapResult(
+      flatMapResult(ok(profile), (d) =>
+        flatMapResult(validateName(d.name), (name) => ok({ ...d, name }))
+      ),
+      (d) => flatMapResult(validateEmail(d.email), (email) => ok({ ...d, email }))
+    ),
+    (d) => flatMapResult(validateAge(d.age), (age) => ok({ ...d, age }))
+  );
+
+  return flatMapResult(base, (d) => {
+    if (d.website && !/^https?:\/\/.+/.test(d.website)) {
+      return err({ field: 'website', code: 'INVALID_URL', message: 'Website must be a valid URL' });
+    }
+    return ok(d);
+  });
+};
+```
+
+## Async validation (uniqueness checks)
+
+Some constraints require a database lookup. Run sync validation first, then the async check.
+
+```typescript
+import { fromPromise, flatMapAsyncResult, okAsync, errAsync, AsyncResultInner } from '@deessejs/fp';
+
+const checkEmailUnique = (email: string): AsyncResultInner<string, ValidationError> =>
+  fromPromise(
+    fetch(`/api/users/exists?email=${encodeURIComponent(email)}`)
+      .then((r) => r.json() as Promise<{ exists: boolean }>)
+      .then(({ exists }) => {
+        if (exists) throw new Error('taken');
+        return email;
+      })
+  ).mapErrAsyncResult((): ValidationError => ({
+    field: 'email',
+    code: 'ALREADY_EXISTS',
+    message: 'An account with this email already exists',
+  }));
+
+const validateFormAsync = async (
+  form: RegistrationForm
+): Promise<Result<RegistrationForm, ValidationError>> => {
+  // 1. Run sync validation first — bail early before hitting the network
+  const syncResult = validateForm(form);
+  if (isErr(syncResult)) return syncResult;
+
+  // 2. Check uniqueness only if sync passes
+  const emailCheck = await checkEmailUnique(form.email);
+  if (isErr(emailCheck)) return err(emailCheck.error);
+
+  return ok(form);
+};
+```
+
+## Displaying errors in UI
+
+The `ValidationError` shape is designed to be used directly in any UI layer.
+
+<Tabs>
+  <Tab title="React">
+    ```tsx
+    import { isErr, isOk } from '@deessejs/fp';
+
+    function RegistrationForm() {
+      const [fieldErrors, setFieldErrors] = React.useState<Record<string, string>>({});
+
+      const handleSubmit = (e: React.FormEvent<HTMLFormElement>) => {
+        e.preventDefault();
+        const data = new FormData(e.currentTarget);
+        const form = {
+          name: data.get('name') as string,
+          email: data.get('email') as string,
+          age: Number(data.get('age')),
+          password: data.get('password') as string,
+        };
+
+        const result = validateFormAll(form);
+
+        if (isErr(result)) {
+          const map: Record<string, string> = {};
+          result.error.errors.forEach((e) => { map[e.field] = e.message; });
+          setFieldErrors(map);
+          return;
+        }
+
+        // isOk(result) — safe to submit
+        setFieldErrors({});
+        submitRegistration(result.value);
+      };
+
+      return (
+        <form onSubmit={handleSubmit}>
+          <input name="name" />
+          {fieldErrors.name && <p role="alert">{fieldErrors.name}</p>}
+
+          <input name="email" type="email" />
+          {fieldErrors.email && <p role="alert">{fieldErrors.email}</p>}
+
+          <input name="age" type="number" />
+          {fieldErrors.age && <p role="alert">{fieldErrors.age}</p>}
+
+          <input name="password" type="password" />
+          {fieldErrors.password && <p role="alert">{fieldErrors.password}</p>}
+
+          <button type="submit">Register</button>
+        </form>
+      );
+    }
+    ```
+  </Tab>
+  <Tab title="Vanilla TypeScript">
+    ```typescript
+    import { isErr, isOk, matchResult } from '@deessejs/fp';
+
+    function handleSubmit(form: RegistrationForm) {
+      const result = validateFormAll(form);
+
+      matchResult(
+        result,
+        (validated) => {
+          // Clear all error states and proceed
+          clearErrors();
+          submitRegistration(validated);
+        },
+        ({ errors }) => {
+          errors.forEach(({ field, message }) => {
+            const el = document.getElementById(`error-${field}`);
+            if (el) el.textContent = message;
+          });
+        }
+      );
+    }
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+  The `code` field on `ValidationError` is useful for internationalisation — look up a translated string by code rather than hard-coding messages in your validators.
+</Note>
+
+<CardGroup cols={2}>
+  <Card title="Result" icon="circle-check" href="/core/result">
+    Full API reference for `ok`, `err`, `flatMapResult`, `matchResult`, and friends.
+  </Card>
+  <Card title="HTTP API calls" icon="cloud" href="/examples/http-api">
+    Apply the same patterns to typed async API errors with `AsyncResult`.
+  </Card>
+  <Card title="Database operations" icon="database" href="/examples/database">
+    Chain database writes with `flatMapResult` and convert `Maybe` to `Result`.
+  </Card>
+  <Card title="Error handling patterns" icon="shield" href="/guides/error-handling-patterns">
+    Broader guide to structuring errors across your application.
+  </Card>
+</CardGroup>

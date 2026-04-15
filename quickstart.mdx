@@ -1,80 +1,182 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: "Get started with @deessejs/fp"
+description: "Install @deessejs/fp and write your first type-safe error handling pipeline in under five minutes, from install to exhaustive pattern matching."
+keywords: ["quickstart", "result", "flatMapResult", "matchResult", "typescript", "error handling"]
 ---
 
-## Get started in three steps
+This guide walks you through everything from installation to a complete error-handling pipeline using `Result`. By the end, you will have replaced a `try/catch` block with a composable, type-safe alternative that the TypeScript compiler can verify at every step.
 
-Get your documentation site running locally and make your first customization.
+<Steps>
+  <Step title="Install the package">
+    Add `@deessejs/fp` to your project with your preferred package manager.
 
-### Step 1: Set up your local environment
+    ```bash
+    npm install @deessejs/fp
+    ```
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+    The package ships as both ESM and CommonJS, so it works in Node.js, Next.js, Vite, and any other TypeScript environment without configuration.
+  </Step>
 
-### Step 2: Deploy your changes
+  <Step title="Parse JSON safely with Result">
+    The `Result` type represents an operation that either succeeds (`Ok`) or fails (`Err`). Use `ok()` to wrap a success value and `err()` to wrap an error.
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+    ```typescript
+    import { ok, err, Result } from '@deessejs/fp'
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+    class ParseError extends Error {
+      constructor(message: string) {
+        super(message)
+        this.name = 'ParseError'
+      }
+    }
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+    function parseConfig(raw: string): Result<Record<string, unknown>, ParseError> {
+      try {
+        return ok(JSON.parse(raw))
+      } catch (e) {
+        return err(new ParseError(String(e)))
+      }
+    }
 
-### Step 3: Go live
+    const result = parseConfig('{"port": 3000}')
+    ```
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+    The return type `Result<Record<string, unknown>, ParseError>` tells every caller that this function can fail — no `try/catch` required at the call site.
+  </Step>
+
+  <Step title="Check the result with isOk and isErr">
+    Use the `isOk` and `isErr` type guards to narrow the result. TypeScript knows the exact shape inside each branch.
+
+    ```typescript
+    import { ok, err, isOk, isErr, Result } from '@deessejs/fp'
+
+    class ParseError extends Error {
+      constructor(message: string) {
+        super(message)
+        this.name = 'ParseError'
+      }
+    }
+
+    function parseConfig(raw: string): Result<Record<string, unknown>, ParseError> {
+      try {
+        return ok(JSON.parse(raw))
+      } catch (e) {
+        return err(new ParseError(String(e)))
+      }
+    }
+
+    const result = parseConfig('{"port": 3000}')
+
+    if (isOk(result)) {
+      // TypeScript knows: result.value is Record<string, unknown>
+      console.log('Parsed config:', result.value)
+    }
+
+    if (isErr(result)) {
+      // TypeScript knows: result.error is ParseError
+      console.error('Parse failed:', result.error.message)
+    }
+    ```
+  </Step>
+
+  <Step title="Chain operations with flatMapResult">
+    Use `flatMapResult` to chain operations that can each return a `Result`. If any step returns `Err`, the chain short-circuits and the error propagates automatically.
+
+    ```typescript
+    import { ok, err, flatMapResult, mapResult, Result } from '@deessejs/fp'
+
+    class ParseError extends Error {
+      constructor(message: string) { super(message); this.name = 'ParseError' }
+    }
+    class ValidationError extends Error {
+      constructor(public field: string) { super(`Missing field: ${field}`); this.name = 'ValidationError' }
+    }
+
+    interface Config { port: number; host: string }
+
+    function parseConfig(raw: string): Result<Record<string, unknown>, ParseError> {
+      try {
+        return ok(JSON.parse(raw))
+      } catch (e) {
+        return err(new ParseError(String(e)))
+      }
+    }
+
+    function validateConfig(
+      data: Record<string, unknown>
+    ): Result<Config, ValidationError> {
+      if (typeof data.port !== 'number') return err(new ValidationError('port'))
+      if (typeof data.host !== 'string') return err(new ValidationError('host'))
+      return ok({ port: data.port as number, host: data.host as string })
+    }
+
+    // Chain parse → validate in one pipeline
+    // Error type is automatically widened to ParseError | ValidationError
+    const config: Result<Config, ParseError | ValidationError> = flatMapResult(
+      parseConfig('{"port": 3000, "host": "localhost"}'),
+      validateConfig
+    )
+
+    // mapResult transforms only the success value
+    const summary = mapResult(config, c => `${c.host}:${c.port}`)
+    ```
+
+    <Tip>
+      TypeScript automatically widens the error type union as you chain operations. A `Result<Config, ParseError>` chained into a function returning `Result<Config, ValidationError>` produces `Result<Config, ParseError | ValidationError>`.
+    </Tip>
+  </Step>
+
+  <Step title="Handle all cases with matchResult">
+    `matchResult` provides exhaustive pattern matching — you must handle both the success and error branches, and TypeScript enforces it at compile time.
+
+    ```typescript
+    import { ok, err, flatMapResult, matchResult, Result } from '@deessejs/fp'
+
+    class ParseError extends Error {
+      constructor(message: string) { super(message); this.name = 'ParseError' }
+    }
+    class ValidationError extends Error {
+      constructor(public field: string) { super(`Missing field: ${field}`); this.name = 'ValidationError' }
+    }
+
+    interface Config { port: number; host: string }
+
+    // ... parseConfig and validateConfig from the previous step
+
+    const config: Result<Config, ParseError | ValidationError> = flatMapResult(
+      parseConfig('{"port": 3000, "host": "localhost"}'),
+      validateConfig
+    )
+
+    const message = matchResult(
+      config,
+      // Ok branch: value is Config
+      (c) => `Server ready at ${c.host}:${c.port}`,
+      // Err branch: error is ParseError | ValidationError
+      (e) => `Config error: ${e.message}`
+    )
+
+    console.log(message)
+    // → "Server ready at localhost:3000"
+    ```
+
+    Because the error type is a discriminated union, TypeScript verifies that you have handled every variant inside the `Err` branch. Removing a `case` is a compile error.
+  </Step>
+</Steps>
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Result" icon="circle-check" href="/core/result">
+    Full API reference for `ok`, `err`, `mapResult`, `flatMapResult`, `allResult`, and more.
+  </Card>
+  <Card title="Maybe" icon="circle-question" href="/core/maybe">
+    Replace `null` and `undefined` with `Some` and `None` for safe optional value handling.
+  </Card>
+  <Card title="AsyncResult" icon="bolt" href="/core/async-result">
+    Chain async operations with `fromPromise`, `mapAsyncResult`, and abort signal support.
+  </Card>
+  <Card title="Error handling patterns" icon="book" href="/guides/error-handling-patterns">
+    Real-world patterns for APIs, validation pipelines, and layered error handling.
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

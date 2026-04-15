@@ -1,0 +1,402 @@
+---
+title: 'Result: type-safe error handling in TypeScript'
+description: 'Model success and failure as first-class values with Ok<T> and Err<E>. Errors are explicit in function signatures, forcing callers to handle every outcome.'
+keywords: ['result', 'ok', 'err', 'error handling', 'type-safe', 'functional']
+---
+
+`Result<T, E>` is a discriminated union that represents either a successful computation (`Ok<T>`) or a failure (`Err<E>`). Unlike exceptions, a `Result` value is part of the function's return type — the compiler forces every caller to acknowledge that an operation can fail. There is no way to accidentally ignore an error when it lives in the type.
+
+## Types
+
+`Ok<T, E>` holds a successful value. Its shape is:
+
+```typescript
+{ ok: true; value: T }
+```
+
+`Err<E>` holds a failure. Its shape is:
+
+```typescript
+{ ok: false; error: E }
+```
+
+Together they form `Result<T, E>`:
+
+```typescript
+type Result<T, E extends Error = Error> = Ok<T, E> | Err<E>;
+```
+
+`Success<T>` is a convenience alias for `Result<T, never>` — a result that is guaranteed to succeed.
+
+`ExtractResultError<T>` is a utility type that extracts the error type from a function returning `Result`:
+
+```typescript
+type MyError = ExtractResultError<typeof myFunction>;
+```
+
+---
+
+## Constructors
+
+### `ok(value)`
+
+Creates a successful `Ok<T, E>`.
+
+```typescript
+import { ok } from '@deessejs/fp';
+
+const result = ok(42);
+// { ok: true, value: 42 }
+```
+
+### `err(error)`
+
+Creates a failed `Err<E>`. The error type `E` must be compatible with the library's `Error` type — either a native `Error` subclass, or an object created by the `error()` factory from the error system.
+
+```typescript
+import { err } from '@deessejs/fp';
+
+// Using native Error subclass
+class NotFoundError extends Error {
+  constructor(public id: number) {
+    super(`Not found: ${id}`);
+    this.name = 'NotFoundError';
+  }
+}
+
+const result = err(new NotFoundError(123));
+// { ok: false, error: NotFoundError }
+
+// Using the structured error() factory (recommended for domain errors)
+import { error } from '@deessejs/fp';
+import { z } from 'zod';
+
+const UserNotFoundError = error({
+  name: 'UserNotFoundError',
+  schema: z.object({ id: z.number() }),
+});
+
+const structured = err(UserNotFoundError({ id: 123 }));
+// { ok: false, error: { name: 'UserNotFoundError', args: { id: 123 }, ... } }
+```
+
+<Note>
+Plain objects like `{ type: 'not_found' }` are not directly compatible with the `err()` error type constraint. Use either native `Error` subclasses or the `error()` builder from `@deessejs/fp` to create properly typed domain errors.
+</Note>
+
+---
+
+## Type guards
+
+### `isOk(result)`
+
+Narrows `Result<T, E>` to `Ok<T, E>`.
+
+```typescript
+import { ok, isOk } from '@deessejs/fp';
+
+const result = ok(42);
+
+if (isOk(result)) {
+  console.log(result.value); // TypeScript knows: result is Ok<number>
+}
+```
+
+### `isErr(result)`
+
+Narrows `Result<T, E>` to `Err<E>`.
+
+```typescript
+import { err, isErr } from '@deessejs/fp';
+
+const result = err(new Error('oops'));
+
+if (isErr(result)) {
+  console.log(result.error.message); // TypeScript knows: result is Err<Error>
+}
+```
+
+---
+
+## Transformations
+
+### `mapResult(result, fn)`
+
+Applies `fn` to the value inside `Ok`. Passes `Err` through unchanged.
+
+```typescript
+import { ok, err, mapResult } from '@deessejs/fp';
+
+mapResult(ok(2), x => x * 2);         // Ok(4)
+mapResult(err(new Error('x')), x => x * 2); // Err(Error: 'x')
+```
+
+### `flatMapResult(result, fn)`
+
+Chains operations that themselves return a `Result`. Use this when your transformation can also fail.
+
+```typescript
+import { ok, err, flatMapResult, Result } from '@deessejs/fp';
+
+const parsePositive = (n: number): Result<number, Error> =>
+  n > 0 ? ok(n) : err(new Error('Must be positive'));
+
+flatMapResult(ok(5), parsePositive);   // Ok(5)
+flatMapResult(ok(-1), parsePositive);  // Err(Error: 'Must be positive')
+flatMapResult(err(new Error('x')), parsePositive); // Err(Error: 'x')
+```
+
+### `mapErr(result, fn)`
+
+Transforms the error inside `Err`. Passes `Ok` through unchanged.
+
+```typescript
+import { err, ok, mapErr } from '@deessejs/fp';
+
+mapErr(err(new Error('not found')), e => new RangeError(e.message));
+// Err(RangeError: 'not found')
+
+mapErr(ok(42), e => new RangeError(e.message));
+// Ok(42)
+```
+
+---
+
+## Extraction
+
+### `getOrElseResult(result, defaultValue)`
+
+Returns the value if `Ok`, or `defaultValue` if `Err`.
+
+```typescript
+import { ok, err, getOrElseResult } from '@deessejs/fp';
+
+getOrElseResult(ok(42), 0);                   // 42
+getOrElseResult(err(new Error('oops')), 0);   // 0
+```
+
+### `getOrComputeResult(result, fn)`
+
+Returns the value if `Ok`, or calls `fn` to compute a fallback if `Err`. The function is only invoked on failure, making this suitable for expensive defaults.
+
+```typescript
+import { ok, err, getOrComputeResult } from '@deessejs/fp';
+
+getOrComputeResult(ok(42), () => loadDefault());
+// 42  — loadDefault() is never called
+
+getOrComputeResult(err(new Error('oops')), () => loadDefault());
+// result of loadDefault()
+```
+
+---
+
+## Side effects
+
+### `tapResult(result, fn)`
+
+Runs `fn` on the value when `Ok`, then returns the original result unchanged. Useful for logging in the middle of a chain.
+
+```typescript
+import { ok, tapResult } from '@deessejs/fp';
+
+tapResult(ok(42), value => console.log('value:', value));
+// Logs: "value: 42"
+// Returns: Ok(42)
+```
+
+---
+
+## Pattern matching
+
+### `matchResult(result, okFn, errFn)`
+
+The exhaustive handler — applies `okFn` on success or `errFn` on failure, returning a single unified value.
+
+```typescript
+import { ok, err, matchResult } from '@deessejs/fp';
+
+const message = matchResult(
+  ok(42),
+  value => `Success: ${value}`,
+  error => `Failed: ${error.message}`
+);
+// "Success: 42"
+
+const fallback = matchResult(
+  err(new Error('timeout')),
+  value => value * 2,
+  () => -1
+);
+// -1
+```
+
+---
+
+## Conversions
+
+### `toNullableResult(result)`
+
+Returns the value if `Ok`, or `null` if `Err`.
+
+```typescript
+import { ok, err, toNullableResult } from '@deessejs/fp';
+
+toNullableResult(ok(42));                 // 42
+toNullableResult(err(new Error('x')));    // null
+```
+
+### `toUndefinedResult(result)`
+
+Returns the value if `Ok`, or `undefined` if `Err`.
+
+```typescript
+import { ok, err, toUndefinedResult } from '@deessejs/fp';
+
+toUndefinedResult(ok(42));               // 42
+toUndefinedResult(err(new Error('x'))); // undefined
+```
+
+---
+
+## Combinators
+
+### `allResult(...results)`
+
+Combines multiple results into a single `Result<T[], E>`. Returns `Ok` with an array of all values if every result is `Ok`. Returns the first `Err` encountered (fail-fast).
+
+```typescript
+import { ok, err, allResult } from '@deessejs/fp';
+
+allResult(ok(1), ok(2), ok(3));
+// Ok([1, 2, 3])
+
+allResult(ok(1), err(new Error('bad')), ok(3));
+// Err(Error: 'bad')
+```
+
+### `unwrapResult(result)`
+
+Returns the value if `Ok`, or throws the error if `Err`. Prefer `getOrElseResult` or `matchResult` in production code; `unwrapResult` is useful in tests and scripts.
+
+```typescript
+import { ok, err, unwrapResult } from '@deessejs/fp';
+
+unwrapResult(ok(42));                  // 42
+unwrapResult(err(new Error('oops'))); // throws Error: 'oops'
+```
+
+### `swapResult(result)`
+
+Swaps `Ok` and `Err`. An `Ok(value)` becomes `Err(value)` and vice versa.
+
+```typescript
+import { ok, err, swapResult } from '@deessejs/fp';
+
+swapResult(ok('hello')); // Err('hello')
+swapResult(err(42));     // Ok(42)
+```
+
+---
+
+## Method chaining
+
+Every `Ok` and `Err` object has the same operations available as methods, enabling a fluent style without importing standalone functions.
+
+```typescript
+import { ok, err } from '@deessejs/fp';
+
+const result = ok(5)
+  .map(x => x * 2)          // Ok(10)
+  .map(x => x + 1)          // Ok(11)
+  .flatMap(x =>
+    x > 10 ? ok(x) : err(new Error('too small'))
+  );
+// Err(Error: 'too small')
+```
+
+When the chain hits an `Err`, all subsequent `map` and `flatMap` calls are no-ops — the error passes through to the end unchanged.
+
+<Note>
+`tapErr` is available on the instance API. It mirrors `tap` but runs on `Err` instead of `Ok`, and is useful for logging errors in the middle of a chain without breaking it.
+</Note>
+
+---
+
+## Error type unions
+
+When you chain `flatMapResult`, TypeScript unions the error types automatically. This means you can compose functions with different error types and handle them all at the end.
+
+```typescript
+import { ok, flatMapResult, Result } from '@deessejs/fp';
+
+const step1 = (): Result<string, TypeError>  => ok('hello');
+const step2 = (): Result<number, RangeError> => ok(42);
+
+// Inferred type: Result<number, TypeError | RangeError>
+const result = flatMapResult(step1(), () => step2());
+```
+
+Use discriminated unions on native Error subclasses to exhaustively handle every variant:
+
+```typescript
+class ValidationError extends Error {
+  constructor(public field: string, public detail: string) {
+    super(`Invalid ${field}: ${detail}`);
+    this.name = 'ValidationError';
+  }
+}
+class NetworkError extends Error {
+  constructor(public code: number) {
+    super(`Network error ${code}`);
+    this.name = 'NetworkError';
+  }
+}
+class UnauthorizedError extends Error {
+  constructor() { super('Please log in'); this.name = 'UnauthorizedError'; }
+}
+
+type AppError = ValidationError | NetworkError | UnauthorizedError;
+
+const handleError = (error: AppError): string => {
+  if (error instanceof ValidationError) return `Invalid ${error.field}: ${error.detail}`;
+  if (error instanceof NetworkError)    return `Network error ${error.code}`;
+  return 'Please log in';
+};
+```
+
+<Tip>
+For richer structured errors with typed `args`, contextual `notes`, and cause chaining, use the `error()` builder from the [Error system](/utilities/error-system) instead of native Error subclasses.
+</Tip>
+
+---
+
+## Best practices
+
+<Tip>
+Define specific error types rather than using the generic `Error` base class. Narrow error types let the compiler guide you through every failure mode.
+</Tip>
+
+**Model errors as native Error subclasses or structured `error()` types.** Native Error subclasses support `instanceof` narrowing; the `error()` builder adds typed `args`, contextual `notes`, and cause chaining. Both compose well with `flatMapResult` error unions.
+
+**Use `matchResult` for rendering and display logic.** It forces you to handle both branches and returns a single value, which maps naturally to JSX, template strings, or response objects.
+
+**Keep error handling close to the value.** Extract with `getOrElseResult` or `getOrComputeResult` at the boundary where you need the unwrapped value, rather than threading raw Results deep into code that doesn't need to know about failure.
+
+**Reserve `unwrapResult` for tests.** In application code, prefer explicit handling. Unwrapping in production code re-introduces the exception-style control flow you were trying to avoid.
+
+---
+
+## Related
+
+<CardGroup cols={3}>
+  <Card title="Maybe" icon="circle-question" href="/core/maybe">
+    Optional values without null errors.
+  </Card>
+  <Card title="Try" icon="shield-halved" href="/core/try">
+    Wrap throwing functions safely.
+  </Card>
+  <Card title="AsyncResult" icon="bolt" href="/core/async-result">
+    Async error handling without try/catch.
+  </Card>
+</CardGroup>

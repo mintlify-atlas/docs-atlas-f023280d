@@ -1,0 +1,192 @@
+---
+title: "Install @deessejs/fp"
+description: "Install @deessejs/fp with npm, pnpm, yarn, or bun, configure TypeScript strict mode, and import the package using ESM or CommonJS."
+keywords: ["install", "npm", "pnpm", "yarn", "bun", "tsconfig", "setup", "configuration"]
+---
+
+`@deessejs/fp` is published to npm as a standard package with both ESM and CommonJS output. Install it once, configure TypeScript strict mode, and you are ready to use `Result`, `Maybe`, `Try`, and `AsyncResult` across your project.
+
+## Install the package
+
+<CodeGroup>
+
+```bash npm
+npm install @deessejs/fp
+```
+
+```bash pnpm
+pnpm add @deessejs/fp
+```
+
+```bash yarn
+yarn add @deessejs/fp
+```
+
+```bash bun
+bun add @deessejs/fp
+```
+
+</CodeGroup>
+
+The package has no required runtime dependencies. Everything ships in a single bundle of roughly 2 KB.
+
+## TypeScript configuration
+
+`@deessejs/fp` requires TypeScript 5.0 or later and works best with strict mode enabled. Without `strict: true`, TypeScript will not narrow types correctly inside `isOk` and `isErr` checks.
+
+Add the following to your `tsconfig.json`:
+
+```json tsconfig.json
+{
+  "compilerOptions": {
+    "strict": true,
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "esModuleInterop": true
+  }
+}
+```
+
+<Warning>
+  If `strict` is `false`, TypeScript cannot narrow the `Result` and `Maybe` types inside conditional branches. You will lose the compile-time safety guarantees that make the library useful.
+</Warning>
+
+The `strict` flag enables several checks that matter for `@deessejs/fp`:
+
+| Check | Why it matters |
+|-------|---------------|
+| `strictNullChecks` | Required for `Maybe` narrowing to work correctly |
+| `noImplicitAny` | Prevents untyped error values in `Result<T, E>` |
+| `strictFunctionTypes` | Ensures callbacks passed to `mapResult` are correctly typed |
+
+## Import the package
+
+`@deessejs/fp` exports a single entry point. Import only what you need.
+
+<CodeGroup>
+
+```typescript ESM
+import { ok, err, isOk, isErr, Result } from '@deessejs/fp'
+import { some, none, fromNullable, isSome, isNone, Maybe } from '@deessejs/fp'
+import { attempt, attemptAsync, isTryOk, isTryErr, Try } from '@deessejs/fp'
+import {
+  okAsync,
+  errAsync,
+  fromPromise,
+  mapAsyncResult,
+  flatMapAsyncResult,
+  matchAsyncResult,
+} from '@deessejs/fp'
+```
+
+```typescript CommonJS
+const { ok, err, isOk, isErr } = require('@deessejs/fp')
+const { some, none, fromNullable, isSome, isNone } = require('@deessejs/fp')
+const { attempt, attemptAsync, isTryOk, isTryErr } = require('@deessejs/fp')
+const { okAsync, errAsync, fromPromise } = require('@deessejs/fp')
+```
+
+</CodeGroup>
+
+<Note>
+  All named exports come from the same entry point (`@deessejs/fp`). There are no subpath imports to manage.
+</Note>
+
+## Requirements
+
+| Requirement | Minimum version |
+|-------------|----------------|
+| TypeScript | 5.0 |
+| Node.js | 20 |
+| Zod (optional) | 4.0 |
+
+## Optional: Zod integration
+
+If you use [Zod](https://zod.dev) for schema validation, `@deessejs/fp` works alongside it to produce typed `Result` values from schema parsing. Install Zod separately if you want to use it:
+
+```bash
+npm install zod
+```
+
+You can then combine Zod's `.safeParse` with `Result` to unify error handling:
+
+```typescript
+import { ok, err, Result } from '@deessejs/fp'
+import { z } from 'zod'
+
+const UserSchema = z.object({
+  id: z.number(),
+  email: z.string().email(),
+})
+
+type User = z.infer<typeof UserSchema>
+type SchemaError = { type: 'validation'; issues: z.ZodIssue[] }
+
+function parseUser(data: unknown): Result<User, SchemaError> {
+  const parsed = UserSchema.safeParse(data)
+  if (parsed.success) return ok(parsed.data)
+  return err({ type: 'validation', issues: parsed.error.issues })
+}
+```
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Type narrowing is not working inside isOk / isErr">
+    This almost always means `strictNullChecks` is disabled. Check that your `tsconfig.json` has either `"strict": true` or `"strictNullChecks": true`. If you extend a base config, verify the base config does not override it.
+
+    ```json tsconfig.json
+    {
+      "compilerOptions": {
+        "strict": true
+      }
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="Cannot find module '@deessejs/fp' or its type declarations">
+    Make sure the package is listed in your `node_modules`. Run `npm ls @deessejs/fp` to confirm it is installed. If you use a monorepo, check that the dependency is declared in the correct `package.json` and that your package manager has hoisted or linked it.
+
+    ```bash
+    npm ls @deessejs/fp
+    # Should print: @deessejs/fp@3.0.0
+    ```
+  </Accordion>
+
+  <Accordion title="ESM import errors in Node.js">
+    `@deessejs/fp` ships as ESM by default. If your project uses `"type": "commonjs"` (or no `"type"` field), Node.js may reject the import. Either switch your project to `"type": "module"`, or use the CommonJS `require()` syntax shown in the import examples above.
+
+    Alternatively, set `"module": "NodeNext"` and `"moduleResolution": "NodeNext"` in `tsconfig.json` to let TypeScript pick the correct export condition automatically.
+  </Accordion>
+
+  <Accordion title="Result or Maybe types are inferred as 'any'">
+    This usually happens when a function that returns `Result` has an untyped catch block. Always annotate the error type explicitly:
+
+    ```typescript
+    import { ok, err, Result } from '@deessejs/fp'
+
+    // Bad: error type inferred as any
+    function parse(s: string) {
+      try {
+        return ok(JSON.parse(s))
+      } catch (e) {
+        return err(e) // e is 'any' here
+      }
+    }
+
+    // Good: error type is explicit
+    function parse(s: string): Result<unknown, { message: string }> {
+      try {
+        return ok(JSON.parse(s))
+      } catch (e) {
+        return err({ message: String(e) })
+      }
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="pnpm or yarn workspaces cannot resolve the package">
+    In a monorepo, make sure `@deessejs/fp` is declared as a dependency in the `package.json` of the workspace package that imports it. Do not rely on hoisting alone. For pnpm, you may also need to add `@deessejs/fp` to the `public-hoist-pattern` list if you need it at the root.
+  </Accordion>
+</AccordionGroup>

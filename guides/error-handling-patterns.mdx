@@ -1,0 +1,318 @@
+---
+title: "Error handling patterns for TypeScript apps"
+description: "Seven practical patterns for robust TypeScript apps: defining error types, composing Result chains, exhaustive matching, and grouping validation errors."
+keywords: ["error handling", "Result", "Maybe", "TypeScript", "functional programming", "discriminated union"]
+---
+
+This guide covers the patterns that make error handling predictable and type-safe in real TypeScript applications. Rather than surveying the API, each pattern addresses a concrete problem you will encounter when building services, APIs, or UI layers with `@deessejs/fp`.
+
+## Pattern 1: Define error types up front
+
+Before writing any function that can fail, define your error types using the `error()` builder. This forces you to think about the error space before writing logic and gives every error a name, typed arguments, and the ability to add contextual notes.
+
+```typescript
+import { error, type ExtractError } from '@deessejs/fp';
+import { z } from 'zod';
+
+// Define every possible failure in your domain using the error() builder
+const UserNotFoundError = error({
+  name: 'UserNotFoundError',
+  schema: z.object({ id: z.number() }),
+});
+
+const ValidationError = error({
+  name: 'ValidationError',
+  schema: z.object({ field: z.string(), message: z.string() }),
+});
+
+const NetworkError = error({
+  name: 'NetworkError',
+  schema: z.object({ statusCode: z.number(), message: z.string() }),
+});
+
+// Extract types for use in Result signatures
+type UserNotFound = ExtractError<typeof UserNotFoundError>;
+type Validation = ExtractError<typeof ValidationError>;
+type Network = ExtractError<typeof NetworkError>;
+
+type UserError = UserNotFound | Validation | Network;
+```
+
+Each error builder returns an `Error<T>` object — compatible with `err()` and the Result chain. The `name` field uniquely identifies the error type for discriminated handling.
+
+## Pattern 2: Use Result at function boundaries
+
+Service functions should return `Result` rather than throwing. This makes failures visible in every call site's type signature.
+
+```typescript
+import { ok, err, Result } from '@deessejs/fp';
+
+interface User { id: number; name: string; email: string }
+
+// The caller knows this can fail — no surprises
+const getUser = async (id: number): Promise<Result<User, UserNotFound | Network>> => {
+  const response = await fetch(`/api/users/${id}`);
+
+  if (response.status === 404) {
+    return err(UserNotFoundError({ id }));
+  }
+
+  if (!response.ok) {
+    return err(NetworkError({ statusCode: response.status, message: `HTTP ${response.status}` }));
+  }
+
+  return ok(await response.json());
+};
+```
+
+Avoid mixing `throw` and `Result` in the same codebase layer. Pick one boundary — typically the service layer — and return `Result` consistently from there outward.
+
+## Pattern 3: Chain with flatMap
+
+When one operation depends on the result of another, use `flatMapResult` to chain them. Errors from any step short-circuit the chain automatically, without nested `if` statements.
+
+```typescript
+import { ok, err, flatMapResult, mapResult, Result } from '@deessejs/fp';
+import { error, type ExtractError } from '@deessejs/fp';
+import { z } from 'zod';
+
+const UnauthorizedError = error({ name: 'UnauthorizedError' });
+const ValidationError = error({
+  name: 'ValidationError',
+  schema: z.object({ field: z.string(), message: z.string() }),
+});
+
+type AppError = ExtractError<typeof UserNotFoundError> | ExtractError<typeof UnauthorizedError> | ExtractError<typeof ValidationError>;
+
+const findUser = (id: number): Result<User, AppError> => { /* ... */ };
+const checkPermission = (user: User): Result<User, AppError> => {
+  if (!user.role?.includes('admin')) return err(UnauthorizedError());
+  return ok(user);
+};
+const validateEmail = (email: string): Result<string, AppError> => {
+  if (!email.includes('@')) {
+    return err(ValidationError({ field: 'email', message: 'Invalid format' }));
+  }
+  return ok(email);
+};
+
+// Each step only runs if the previous one succeeded
+const updateUserEmail = (id: number, email: string): Result<User, AppError> =>
+  flatMapResult(
+    flatMapResult(findUser(id), checkPermission),
+    (user) => mapResult(validateEmail(email), (validEmail) => ({ ...user, email: validEmail }))
+  );
+```
+
+<Tip>
+When chaining three or more steps, consider using `pipe` from `@deessejs/fp` to keep the code linear and readable.
+</Tip>
+
+## Pattern 4: Use matchResult for exhaustive handling
+
+At the UI or response layer, use `matchResult` to handle both branches explicitly. Unlike `isOk` guards, `matchResult` forces you to handle both cases in one expression and returns a typed value.
+
+```typescript
+import { matchResult } from '@deessejs/fp';
+
+// Express.js route handler
+app.get('/users/:id', async (req, res) => {
+  const result = await getUser(Number(req.params.id));
+
+  const response = matchResult(
+    result,
+    (user) => ({ status: 200, body: user }),
+    (error) => {
+      // Discriminate by the error's .name property
+      switch (error.name) {
+        case 'UserNotFoundError':
+          return { status: 404, body: { message: `User not found: ${error.args.id}` } };
+        case 'NetworkError':
+          return { status: 502, body: { message: 'Upstream error' } };
+        case 'UnauthorizedError':
+          return { status: 403, body: { message: 'Forbidden' } };
+        default:
+          return { status: 500, body: { message: error.message } };
+      }
+    }
+  );
+
+  res.status(response.status).json(response.body);
+});
+```
+
+Discriminate errors by `error.name` — each `error()` builder produces objects with a unique `name` field.
+
+## Pattern 5: Combine multiple Results with allResult
+
+When you need all of several independent operations to succeed before proceeding, `allResult` collects them and fails fast on the first error.
+
+```typescript
+import { ok, err, allResult, mapResult, Result } from '@deessejs/fp';
+import { error, type ExtractError } from '@deessejs/fp';
+import { z } from 'zod';
+
+const FieldError = error({
+  name: 'FieldError',
+  schema: z.object({ field: z.string(), message: z.string() }),
+});
+type FieldErrorType = ExtractError<typeof FieldError>;
+
+const validateName = (name: string): Result<string, FieldErrorType> =>
+  name.length >= 2
+    ? ok(name)
+    : err(FieldError({ field: 'name', message: 'Must be at least 2 characters' }));
+
+const validateEmail = (email: string): Result<string, FieldErrorType> =>
+  email.includes('@')
+    ? ok(email)
+    : err(FieldError({ field: 'email', message: 'Invalid email format' }));
+
+const validateAge = (age: number): Result<number, FieldErrorType> =>
+  age >= 13 && age <= 120
+    ? ok(age)
+    : err(FieldError({ field: 'age', message: 'Must be between 13 and 120' }));
+
+// All three must pass; first failure short-circuits
+const validateRegistration = (name: string, email: string, age: number) =>
+  mapResult(
+    allResult(validateName(name), validateEmail(email), validateAge(age)),
+    ([validName, validEmail, validAge]) => ({ name: validName, email: validEmail, age: validAge })
+  );
+```
+
+<Note>
+`allResult` uses fail-fast semantics—it returns the first `Err` it encounters. If you need to collect all errors (for showing a full form error summary), accumulate them manually with `isErr` checks instead.
+</Note>
+
+## Pattern 6: Use Maybe for optional lookups
+
+When a value may or may not be present—and absence is not an error—use `Maybe`. If you later need an error type for the absence, convert with `toResultMaybe`.
+
+```typescript
+import {
+  fromNullable,
+  mapMaybe,
+  toResultMaybe,
+  getOrElseMaybe,
+  error,
+} from '@deessejs/fp';
+import { z } from 'zod';
+
+interface Config {
+  timeout: number;
+  retries: number;
+}
+
+// fromNullable turns null/undefined into None, everything else into Some
+const getConfigValue = (key: string): Maybe<string> =>
+  fromNullable(process.env[key]);
+
+// Map over the value if present
+const timeout = mapMaybe(
+  getConfigValue('REQUEST_TIMEOUT_MS'),
+  (s) => parseInt(s, 10)
+);
+
+// Provide a default for None
+const timeoutMs = getOrElseMaybe(timeout, 5000);
+
+// Convert to Result when you need an error type
+const MissingConfigError = error({
+  name: 'MissingConfigError',
+  schema: z.object({ key: z.string() }),
+});
+
+const requireApiKey = () =>
+  toResultMaybe(
+    getConfigValue('API_KEY'),
+    () => MissingConfigError({ key: 'API_KEY' })
+  );
+```
+
+Use `Maybe` for lookups in collections, optional config, and chained property access. Switch to `Result` when absence needs a specific error message that callers must handle.
+
+## Pattern 7: Error grouping with exceptionGroup
+
+When running multiple validations that should all be checked before reporting back, use `exceptionGroup` to bundle structured errors into a single value.
+
+```typescript
+import {
+  error,
+  exceptionGroup,
+  err,
+  ok,
+  isErr,
+  type Result,
+} from '@deessejs/fp';
+import { z } from 'zod';
+
+// Define typed error builders
+const NameError = error({
+  name: 'NameError',
+  schema: z.object({ value: z.string(), reason: z.string() }),
+  message: ({ value, reason }) => `Name "${value}" is invalid: ${reason}`,
+});
+
+const EmailError = error({
+  name: 'EmailError',
+  schema: z.object({ value: z.string() }),
+  message: ({ value }) => `"${value}" is not a valid email`,
+});
+
+type FormError = ReturnType<typeof exceptionGroup>;
+
+const validateForm = (
+  name: string,
+  email: string
+): Result<{ name: string; email: string }, FormError> => {
+  const errors: import('@deessejs/fp').Error[] = [];
+
+  if (name.length < 2) {
+    errors.push(NameError({ value: name, reason: 'too short' }));
+  }
+  if (!email.includes('@')) {
+    errors.push(EmailError({ value: email }));
+  }
+
+  if (errors.length > 0) {
+    return err(exceptionGroup(errors));
+  }
+
+  return ok({ name, email });
+};
+
+// Handling
+const result = validateForm('X', 'notanemail');
+
+if (isErr(result)) {
+  for (const e of result.error.exceptions) {
+    console.error(e.message);
+  }
+}
+```
+
+## When to use each type
+
+| Situation | Type | Why |
+|-----------|------|-----|
+| Operation can fail with a named error | `Result<T, E>` | Caller must handle failure explicitly |
+| Value may or may not exist | `Maybe<T>` | Absence is not an error; it's expected |
+| Calling code you can't control that throws | `Try<T, Error>` via `attempt()` | Bridges exceptions into the type system |
+| Async operation that can fail | `AsyncResult<T, E>` via `fromPromise()` | Combines `Result` semantics with `Promise` |
+| Multiple errors from one operation | `Result<T, ErrorGroup>` | Carries all errors in a single value |
+
+<CardGroup cols={2}>
+  <Card title="Result" icon="circle-check" href="/core/result">
+    Success and failure in one type. The foundation for all error handling.
+  </Card>
+  <Card title="Maybe" icon="circle-question" href="/core/maybe">
+    Optional values without null checks.
+  </Card>
+  <Card title="Try" icon="shield" href="/core/try">
+    Wrap throwing functions safely with `attempt`.
+  </Card>
+  <Card title="AsyncResult" icon="bolt" href="/core/async-result">
+    Chain async operations with the same Result semantics.
+  </Card>
+</CardGroup>

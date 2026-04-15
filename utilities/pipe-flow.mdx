@@ -1,0 +1,275 @@
+---
+title: "Compose functions with pipe and flow utilities"
+description: "Replace nested function calls with left-to-right pipelines using pipe, flow, pipeAsync, and flowAsync. Add safe side effects with tap, tapAsync, and tapSafe."
+---
+
+Functional code naturally accumulates nesting: the output of one function feeds into another, then another, until you're reading inside-out. `pipe` and `flow` reverse that: they thread a value through a sequence of functions written left-to-right, top-to-bottom, in the order they execute. The result reads like a recipe rather than an expression tree.
+
+## Before and after
+
+```typescript
+// Nested calls — read inside-out, hard to follow
+const result = handleError(
+  validate(
+    normalize(
+      trim(rawInput)
+    )
+  )
+);
+
+// pipe — read top-to-bottom in execution order
+import { pipe } from '@deessejs/fp';
+
+const result = pipe(
+  rawInput,
+  trim,
+  normalize,
+  validate,
+  handleError,
+);
+```
+
+## API reference
+
+### `pipe(value, ...fns)` — pass value through functions
+
+Applies each function to the result of the previous, returning the final value. Synchronous. Type-safe for up to seven functions; a fallback overload handles more.
+
+```typescript
+import { pipe } from '@deessejs/fp';
+
+const result = pipe(
+  '  hello world  ',
+  s => s.trim(),
+  s => s.toUpperCase(),
+  s => s.replace(' ', '_'),
+);
+// 'HELLO_WORLD'
+```
+
+With `Result` operations:
+
+```typescript
+import { pipe, mapResult, getOrElseResult } from '@deessejs/fp';
+
+const username = pipe(
+  fetchUser(id),                              // Result<User, Error>
+  r => mapResult(r, u => u.displayName),      // Result<string, Error>
+  r => mapResult(r, s => s.trim()),           // Result<string, Error>
+  r => getOrElseResult(r, 'Anonymous'),       // string
+);
+```
+
+<Note>
+`mapResult`, `flatMapResult`, and `getOrElseResult` are **not curried** — they take the result as the first argument. When using them inside `pipe`, wrap each call in an arrow function as shown above, or use method chaining on `Ok`/`Err` objects directly.
+</Note>
+
+### `flow(...fns)` — create a reusable pipeline
+
+`flow` is `pipe` without the initial value. It returns a function that, when called, threads its argument(s) through the composed steps. The first function may accept multiple arguments; subsequent functions are unary.
+
+```typescript
+import { flow } from '@deessejs/fp';
+
+const processName = flow(
+  (s: string) => s.trim(),
+  s => s.toLowerCase(),
+  s => s.replace(/\s+/g, '_'),
+);
+
+processName('  Hello World  '); // 'hello_world'
+processName('  Jane Doe  ');    // 'jane_doe'
+
+// First function can be multi-argument
+const addThenStringify = flow(
+  (a: number, b: number) => a + b,
+  n => n.toString(),
+);
+
+addThenStringify(5, 10); // '15'
+```
+
+### `pipeAsync(value, ...fns)` — async pipe
+
+Like `pipe`, but each function may return a `Promise`. Only awaits steps that actually return a thenable — synchronous steps have no overhead. The initial value may itself be a `Promise`.
+
+```typescript
+import { pipeAsync } from '@deessejs/fp';
+
+const profile = await pipeAsync(
+  fetchUser(id),                  // Promise<User> or User
+  async user => validateUser(user),
+  user => user.profile,           // sync step — no await overhead
+);
+```
+
+Mixing sync and async freely:
+
+```typescript
+const result = await pipeAsync(
+  userId,                                      // string
+  id => db.users.findById(id),                // Promise<User | null>
+  user => resultFromNullable(user, () => NotFoundError({ id: userId })),
+  async result => result.ok
+    ? enrichWithPermissions(result.value)     // Promise<EnrichedUser>
+    : result,
+);
+```
+
+### `flowAsync(...fns)` — create a reusable async pipeline
+
+`flowAsync` is to `pipeAsync` what `flow` is to `pipe`. Returns an async function.
+
+```typescript
+import { flowAsync } from '@deessejs/fp';
+
+const processUser = flowAsync(
+  async (id: string) => fetchUser(id),
+  async user => validatePermissions(user),
+  user => user.profile,
+);
+
+// Reuse across many call sites
+const profile1 = await processUser('user-1');
+const profile2 = await processUser('user-2');
+```
+
+### `tap(fn)` — synchronous side effect in a pipeline
+
+Returns a curried function `(value: T) => T`. The side-effect function receives the value, runs, and the original value passes through unchanged. Use it for logging or debugging without breaking the pipeline's type flow.
+
+```typescript
+import { pipe, tap } from '@deessejs/fp';
+
+const result = pipe(
+  fetchUser(id),
+  tap(result => console.log('fetchUser result:', result)),
+  mapResult(u => u.email),
+  tap(result => console.log('email result:', result)),
+);
+```
+
+### `tapAsync(fn)` — async side effect in a pipeline
+
+Same as `tap`, but the side-effect function may return a `Promise`. The pipeline awaits it before continuing.
+
+```typescript
+import { pipeAsync, tapAsync } from '@deessejs/fp';
+
+const result = await pipeAsync(
+  userId,
+  fetchUser,
+  tapAsync(async user => {
+    await analytics.track('user_fetched', { id: user.id });
+  }),
+  user => user.profile,
+);
+```
+
+### `tapSafe(fn, onError?)` — side effect that won't throw
+
+Like `tap`, but wraps the side-effect in a try/catch. If the side-effect throws, the error is optionally forwarded to `onError` and the pipeline continues with the original value. Use for non-critical logging paths that must never break the main flow.
+
+```typescript
+import { pipe, tapSafe } from '@deessejs/fp';
+
+const result = pipe(
+  computeExpensiveValue(),
+  tapSafe(
+    value => externalLogger.log(value),   // might throw
+    err => console.error('Logger failed:', err),
+  ),
+  processValue,
+);
+// Never fails due to logger errors
+```
+
+## `yield` and `immediate` — event loop utilities
+
+Exported from `yield.ts`, these helpers yield control to the event loop without introducing an artificial delay. Useful when performing heavy synchronous work in a loop and you want to keep the UI or I/O responsive.
+
+```typescript
+import { yield as yieldControl, immediate } from '@deessejs/fp';
+
+// Pause and let the event loop breathe
+for (const chunk of largeDataSet) {
+  processChunk(chunk);
+  await yieldControl(); // scheduler.yield → setImmediate → MessageChannel → setTimeout(0)
+}
+
+// immediate is an alias for yieldControl
+await immediate();
+```
+
+The implementation tries, in order: `scheduler.yield()` (modern browsers), `setImmediate` (Node.js/Bun), `MessageChannel` (browsers — avoids the 4 ms `setTimeout` clamp), then `setTimeout(0)` as a universal fallback.
+
+## Examples with Result and Maybe
+
+<Tabs>
+  <Tab title="Result pipeline">
+    ```typescript
+    import { pipe, mapResult, flatMapResult, matchResult } from '@deessejs/fp';
+
+    const response = pipe(
+      parseRequest(req.body),                                          // Result<CreateUserInput, ValidationError>
+      r => flatMapResult(r, input => createUser(input)),               // Result<User, DbError | ConflictError>
+      r => mapResult(r, user => ({ id: user.id, created: true })),
+      r => matchResult(
+        r,
+        payload => res.json(payload),
+        error => res.status(400).json({ error: error.name }),
+      ),
+    );
+    ```
+  </Tab>
+  <Tab title="Maybe pipeline">
+    ```typescript
+    import { pipe, mapMaybe, getOrElseMaybe, fromNullable } from '@deessejs/fp';
+
+    const displayName = pipe(
+      fromNullable(req.session?.user),              // Maybe<SessionUser>
+      m => mapMaybe(m, u => u.profile),             // Maybe<Profile>
+      m => mapMaybe(m, p => p.displayName),         // Maybe<string>
+      m => getOrElseMaybe(m, 'Guest'),              // string
+    );
+    ```
+  </Tab>
+  <Tab title="Async Result pipeline">
+    ```typescript
+    import { pipeAsync, flatMapAsyncResult, mapAsyncResult } from '@deessejs/fp';
+
+    const order = await pipeAsync(
+      validateOrderInput(req.body),                                         // Result<OrderInput, ValidationError>
+      async r => flatMapAsyncResult(r, input => reserveInventory(input)),   // Result<Reserved, StockError>
+      async r => flatMapAsyncResult(r, reserved => chargePayment(reserved)),// Result<Order, PaymentError>
+      async r => mapAsyncResult(r, order => order.id),
+    );
+    ```
+  </Tab>
+</Tabs>
+
+## Overload limits and the fallback
+
+Both `pipe` and `flow` have typed overloads for up to seven chained functions. If you exceed seven, TypeScript falls back to an untyped overload (`pipe(value, ...AnyFn[]) => unknown`). For most real-world pipelines seven is more than enough; if you regularly hit this limit, consider breaking the pipeline into named sub-pipelines with intermediate types.
+
+```typescript
+// Split a long pipeline into named steps
+const parsedInput = pipe(rawInput, step1, step2, step3);
+const processed = pipe(parsedInput, step4, step5, step6);
+const output = pipe(processed, step7, step8);
+```
+
+<CardGroup cols={2}>
+  <Card title="Result" href="/core/result">
+    Error-aware type that pipe and flow compose naturally
+  </Card>
+  <Card title="Maybe" href="/core/maybe">
+    Optional values that work in pipe chains
+  </Card>
+  <Card title="Retry" href="/utilities/retry">
+    Retry failed async operations within a pipeline
+  </Card>
+  <Card title="Sleep" href="/utilities/sleep">
+    Delay and timeout helpers for async pipelines
+  </Card>
+</CardGroup>

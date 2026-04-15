@@ -1,0 +1,358 @@
+---
+title: "Async patterns with AsyncResult and retry"
+description: "Seven patterns for robust async TypeScript code: wrapping fetch, chaining operations, parallel runs, fan-out with traverse, retry, cancellation, and timeouts."
+keywords: ["AsyncResult", "async", "retry", "fromPromise", "traverse", "timeout", "TypeScript"]
+---
+
+Async code is where errors are most likely to be swallowed. A rejected promise that slips past a missing `catch` is silent until it causes a bug in production. This guide shows how to use `AsyncResult` and the retry/timeout utilities to make every async failure visible in the type system.
+
+## Pattern 1: Wrap fetch calls with fromPromise
+
+`fromPromise` is the entry point for all external async work. It catches both rejected promises and HTTP-level failures, converting them into `AsyncResult`.
+
+```typescript
+import { fromPromise, mapErrAsyncResult, type AsyncResultInner } from '@deessejs/fp';
+
+interface User {
+  id: number;
+  name: string;
+  email: string;
+}
+
+type ApiError =
+  | { type: 'not_found'; id: number }
+  | { type: 'network'; statusCode: number; message: string };
+
+const fetchUser = (id: number): Promise<AsyncResultInner<User, ApiError>> =>
+  fromPromise(
+    fetch(`/api/users/${id}`).then(async (res) => {
+      if (res.status === 404) throw Object.assign(new Error('Not found'), { statusCode: 404 });
+      if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { statusCode: res.status });
+      return res.json() as Promise<User>;
+    })
+  ).then((r) =>
+    // mapErrAsyncResult lets you refine the raw Error into your domain type
+    mapErrAsyncResult(r, (e: Error & { statusCode?: number }) =>
+      e.statusCode === 404
+        ? ({ type: 'not_found', id } as ApiError)
+        : ({ type: 'network', statusCode: e.statusCode ?? 0, message: e.message } as ApiError)
+    )
+  );
+```
+
+<Tip>
+Throw a typed object from inside the `fetch` chain rather than relying on `fromPromise` to wrap the error. This gives you a richer source to map from in `mapErrAsyncResult`.
+</Tip>
+
+## Pattern 2: Chain async operations with flatMapAsyncResult
+
+`flatMapAsyncResult` threads `AsyncResult` values through a sequence. If any step produces an `Err`, the rest of the chain is skipped.
+
+```typescript
+import {
+  fromPromise,
+  flatMapAsyncResult,
+  okAsync,
+  type AsyncResultInner,
+} from '@deessejs/fp';
+
+interface Post { id: number; userId: number; title: string }
+
+type FetchError = { type: 'network'; message: string };
+
+const fetchPosts = (userId: number): Promise<AsyncResultInner<Post[], FetchError>> =>
+  fromPromise(
+    fetch(`/api/users/${userId}/posts`).then(async (res) => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json() as Promise<Post[]>;
+    })
+  ).then((r) => mapErrAsyncResult(r, (e) => ({ type: 'network', message: e.message })));
+
+// Chain: fetch user, then fetch their posts
+const getUserWithPosts = async (userId: number) => {
+  const userResult = await fetchUser(userId);
+
+  return flatMapAsyncResult(
+    userResult,
+    async (user) => {
+      const postsResult = await fetchPosts(user.id);
+      return flatMapAsyncResult(
+        postsResult,
+        (posts) => okAsync({ user, posts })
+      );
+    }
+  );
+};
+```
+
+The error type is automatically unioned across steps: `Result<{ user: User; posts: Post[] }, ApiError | FetchError>`.
+
+## Pattern 3: Run operations in parallel with all()
+
+When operations are independent, run them concurrently with `all`. It resolves with a tuple of all values, or throws on the first failure.
+
+```typescript
+import { fromPromise, all } from '@deessejs/fp';
+
+const fetchDashboard = async (userId: number) => {
+  // All three requests start at the same time
+  const [user, stats, notifications] = await all(
+    fromPromise(fetch(`/api/users/${userId}`).then((r) => r.json())),
+    fromPromise(fetch(`/api/users/${userId}/stats`).then((r) => r.json())),
+    fromPromise(fetch(`/api/users/${userId}/notifications`).then((r) => r.json()))
+  );
+
+  return { user, stats, notifications };
+};
+```
+
+<Warning>
+`all` uses fail-fast semantics and throws on the first rejection. If you need to inspect which operations succeeded and which failed, process them sequentially with `flatMapAsyncResult` or use `Promise.allSettled` and wrap each result yourself.
+</Warning>
+
+## Pattern 4: Fan out over arrays with traverse()
+
+`traverse` maps an array of values through an async function and collects the results. Useful for processing a list of IDs, files, or records in parallel.
+
+```typescript
+import { fromPromise, traverse } from '@deessejs/fp';
+
+interface Product { id: number; name: string; price: number }
+
+const fetchProduct = (id: number) =>
+  fromPromise(
+    fetch(`/api/products/${id}`).then(async (res) => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json() as Promise<Product>;
+    })
+  );
+
+// Fetch all products concurrently; short-circuits on the first failure
+const fetchCart = async (productIds: number[]) => {
+  const products = await traverse(productIds, fetchProduct);
+  return products; // AsyncResultInner<Product[], Error>
+};
+```
+
+`traverse` is equivalent to `all(...ids.map(fn))` but reads more cleanly when the mapping function is the focus.
+
+## Pattern 5: Add retry with retryAsync
+
+`retryAsync` wraps any async operation and re-runs it on failure up to a configurable number of times. Combine it with `fromPromise` to add resilience to flaky network calls.
+
+```typescript
+import { fromPromise, retryAsync, mapErrAsyncResult } from '@deessejs/fp';
+
+type ApiError = { type: 'network'; attempts: number; message: string };
+
+const fetchUserWithRetry = (id: number) =>
+  retryAsync(
+    () =>
+      fromPromise(
+        fetch(`/api/users/${id}`).then(async (res) => {
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          return res.json() as Promise<User>;
+        })
+      ),
+    {
+      attempts: 3,
+      delay: 500,
+      backoff: 'exponential',
+      jitter: true,
+      onRetry: (error, attempt) => {
+        console.warn(`Retry ${attempt} for user ${id}: ${error.message}`);
+      },
+    }
+  ).then((r) =>
+    mapErrAsyncResult(r, (e) => ({
+      type: 'network',
+      attempts: 3,
+      message: e.message,
+    } as ApiError))
+  );
+```
+
+<Tabs>
+  <Tab title="Exponential backoff">
+    ```typescript
+    retryAsync(fn, { attempts: 4, delay: 300, backoff: 'exponential', jitter: true })
+    // Waits ~300ms, ~600ms, ~1200ms between attempts, with random jitter
+    ```
+  </Tab>
+  <Tab title="Linear backoff">
+    ```typescript
+    retryAsync(fn, { attempts: 4, delay: 300, backoff: 'linear' })
+    // Waits 300ms, 600ms, 900ms between attempts
+    ```
+  </Tab>
+  <Tab title="Constant backoff">
+    ```typescript
+    retryAsync(fn, { attempts: 4, delay: 1000, backoff: 'constant' })
+    // Waits 1000ms between every attempt
+    ```
+  </Tab>
+  <Tab title="Conditional retry">
+    ```typescript
+    retryAsync(fn, {
+      attempts: 5,
+      delay: 500,
+      predicate: (error) => error.message.includes('ECONNRESET'),
+      // Only retries transient connection errors, not 4xx responses
+    })
+    ```
+  </Tab>
+</Tabs>
+
+## Pattern 6: Cancellation with AbortSignal and withTimeout
+
+Pass an `AbortSignal` to `withTimeout` to make long-running operations cancellable. The operation is rejected when the signal fires.
+
+```typescript
+import { fromPromise, withTimeout } from '@deessejs/fp';
+
+const fetchWithCancellation = (url: string, signal: AbortSignal) =>
+  fromPromise(
+    withTimeout(
+      fetch(url, { signal }).then((res) => res.json()),
+      10_000,
+      { message: 'Request cancelled or timed out', signal }
+    )
+  );
+
+// Caller controls cancellation
+const controller = new AbortController();
+
+// Cancel after 3 seconds from the calling side
+setTimeout(() => controller.abort(), 3000);
+
+const result = await fetchWithCancellation('/api/data', controller.signal);
+```
+
+<Note>
+`signal` passed to `withTimeout` makes the timeout itself cancellable. Without it, the timeout timer will keep running even if you abort from the outside. Always pass the same `AbortSignal` to both `fetch` and `withTimeout`.
+</Note>
+
+## Pattern 7: Timeouts with withTimeout()
+
+For operations that should not run indefinitely, use `withTimeout` to wrap the promise. It resolves with the original value or rejects with a timeout error after the given duration.
+
+```typescript
+import { fromPromise, withTimeout, sleep } from '@deessejs/fp';
+
+type TimeoutError = { type: 'timeout'; durationMs: number };
+
+const withDeadline = <T>(
+  promise: Promise<T>,
+  deadlineMs: number
+): Promise<AsyncResultInner<T, TimeoutError>> =>
+  fromPromise(
+    withTimeout(promise, deadlineMs, {
+      message: `Timed out after ${deadlineMs}ms`,
+      name: 'DEADLINE_EXCEEDED',
+    })
+  ).then((r) =>
+    mapErrAsyncResult(r, () => ({ type: 'timeout', durationMs: deadlineMs }))
+  );
+
+// Usage in a real data-fetching layer
+const fetchWithDeadline = (id: number) =>
+  withDeadline(
+    fetch(`/api/users/${id}`).then((r) => r.json()),
+    5000
+  );
+```
+
+## Building a real data-fetching layer
+
+The patterns above compose naturally into a production-ready fetching layer:
+
+```typescript
+import {
+  fromPromise,
+  flatMapAsyncResult,
+  okAsync,
+  retryAsync,
+  withTimeout,
+  mapErrAsyncResult,
+  matchAsyncResult,
+} from '@deessejs/fp';
+
+type ApiError =
+  | { type: 'not_found'; resource: string }
+  | { type: 'network'; statusCode: number; message: string }
+  | { type: 'timeout'; durationMs: number };
+
+const apiFetch = <T>(url: string, timeoutMs = 5000, retries = 3) =>
+  retryAsync(
+    () =>
+      fromPromise(
+        withTimeout(
+          fetch(url).then(async (res) => {
+            if (res.status === 404) throw Object.assign(new Error('Not found'), { status: 404 });
+            if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
+            return res.json() as Promise<T>;
+          }),
+          timeoutMs,
+          { message: `Timed out after ${timeoutMs}ms`, name: 'TIMEOUT' }
+        )
+      ).then((r) =>
+        mapErrAsyncResult(r, (e: Error & { status?: number }) => {
+          if (e.message.includes('Timed out')) {
+            return { type: 'timeout', durationMs: timeoutMs } as ApiError;
+          }
+          if (e.status === 404) {
+            return { type: 'not_found', resource: url } as ApiError;
+          }
+          return { type: 'network', statusCode: e.status ?? 0, message: e.message } as ApiError;
+        })
+      ),
+    {
+      attempts: retries,
+      delay: 500,
+      backoff: 'exponential',
+      jitter: true,
+      // Only retry network/timeout errors—not 404s
+      predicate: (e) => !e.message.includes('Not found'),
+    }
+  );
+
+// Composed usage
+const getUserOrders = async (userId: number) => {
+  const userResult = await apiFetch<User>(`/api/users/${userId}`);
+
+  return flatMapAsyncResult(userResult, async (user) => {
+    const ordersResult = await apiFetch<Order[]>(`/api/users/${userId}/orders`);
+    return flatMapAsyncResult(ordersResult, (orders) => okAsync({ user, orders }));
+  });
+};
+
+// At the call site
+const result = await getUserOrders(1);
+
+matchAsyncResult(
+  result,
+  ({ user, orders }) => console.log(`${user.name} has ${orders.length} orders`),
+  (error) => {
+    switch (error.type) {
+      case 'not_found': console.error(`Not found: ${error.resource}`); break;
+      case 'timeout': console.error(`Timed out after ${error.durationMs}ms`); break;
+      case 'network': console.error(`Network error ${error.statusCode}`); break;
+    }
+  }
+);
+```
+
+<CardGroup cols={2}>
+  <Card title="AsyncResult reference" icon="book" href="/core/async-result">
+    Full API reference for all AsyncResult functions.
+  </Card>
+  <Card title="Error handling patterns" icon="shield" href="/guides/error-handling-patterns">
+    Synchronous error handling with Result, Maybe, and the error system.
+  </Card>
+  <Card title="Migrating from exceptions" icon="arrow-right" href="/guides/migrating-from-exceptions">
+    Step-by-step guide for moving from try/catch to Result.
+  </Card>
+  <Card title="Result reference" icon="circle-check" href="/core/result">
+    Core Result API for synchronous operations.
+  </Card>
+</CardGroup>

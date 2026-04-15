@@ -1,0 +1,602 @@
+---
+title: 'AsyncResult: async error handling without try/catch'
+description: 'Chain async operations with typed errors using a Thenable wrapper. Errors propagate through the chain automatically — no try/catch or unhandled rejections.'
+keywords: ['async-result', 'promise', 'async', 'error handling', 'abort signal', 'functional']
+---
+
+`AsyncResult<T, E>` is a `Promise`-compatible wrapper around an async `Ok` or `Err`. It implements the `Thenable` interface, so you can `await` it anywhere a `Promise` is expected. Unlike a plain `Promise`, it never rejects — errors are part of the resolved value. This makes async error handling composable: you chain `.map()` and `.flatMap()` calls, and failures automatically short-circuit the rest of the chain.
+
+## Types
+
+`AsyncOk<T>` is the raw resolved value on success:
+
+```typescript
+{ ok: true; value: T }
+```
+
+`AsyncErr<E>` is the raw resolved value on failure:
+
+```typescript
+{ ok: false; error: E }
+```
+
+`AsyncResultInner<T, E>` is the union you get when you `await` an `AsyncResult`:
+
+```typescript
+type AsyncResultInner<T, E> = AsyncOk<T> | AsyncErr<E>;
+```
+
+`AsyncResult<T, E>` itself is the `Thenable` wrapper. Its `.ok` property is `undefined` until the promise settles. Use `isAsyncOk` / `isAsyncErr` on the `await`-ed inner value.
+
+`AbortError` is a structured error emitted when an `AbortSignal` fires:
+
+```typescript
+type AbortError = Error & { name: 'AbortError' };
+```
+
+---
+
+## Constructors
+
+### `okAsync(value)`
+
+Creates an immediately-resolved `AsyncResult<T, never>`.
+
+```typescript
+import { okAsync } from '@deessejs/fp';
+
+const result = await okAsync(42);
+// { ok: true, value: 42 }
+```
+
+### `errAsync(error)`
+
+Creates an immediately-resolved `AsyncResult<never, E>`.
+
+```typescript
+import { errAsync } from '@deessejs/fp';
+
+const result = await errAsync(new Error('Not found'));
+// { ok: false, error: Error: 'Not found' }
+```
+
+### `fromPromise(promise, onError?)`
+
+Wraps a `Promise<T>` into an `AsyncResult<T, E>`. The promise is **never allowed to reject** — any rejection is caught and converted to `AsyncErr`.
+
+```typescript
+import { fromPromise } from '@deessejs/fp';
+
+// Without custom error handler: rejections become Error
+const result = await fromPromise(fetch('/api/users/1'));
+// AsyncOk<Response> or AsyncErr<Error>
+
+// With custom error handler: map the raw error to your type
+type ApiError = { status: number };
+
+const typed = await fromPromise(
+  fetch('/api/users/1').then(r => { if (!r.ok) throw r; return r.json(); }),
+  (e): ApiError => ({ status: (e as Response).status ?? 500 })
+);
+// AsyncOk<User> or AsyncErr<ApiError>
+```
+
+### `fromPromiseWithOptions(promise, options)`
+
+Like `fromPromise` but accepts a `FromPromiseOptions` object. Pass an `AbortSignal` to cancel the operation.
+
+```typescript
+import { fromPromiseWithOptions } from '@deessejs/fp';
+
+const controller = new AbortController();
+
+const result = await fromPromiseWithOptions(
+  fetch('/api/data', { signal: controller.signal }),
+  { signal: controller.signal }
+);
+```
+
+### `from(promise)`
+
+Wraps a `Promise<AsyncResultInner<T, E>>` — use this when you already have a promise that resolves to a raw `{ ok, value/error }` shape.
+
+```typescript
+import { from } from '@deessejs/fp';
+
+const inner = Promise.resolve({ ok: true as const, value: 42 });
+const result = await from(inner);
+// AsyncOk(42)
+```
+
+### `fromValue(value, ms?)`
+
+Creates an `AsyncResult` that resolves after an optional delay. Useful for testing and stubs.
+
+```typescript
+import { fromValue } from '@deessejs/fp';
+
+const result = await fromValue(42, 100);
+// Resolves to AsyncOk(42) after 100 ms
+```
+
+### `fromError(error, ms?)`
+
+Creates an `AsyncResult` that resolves to an error after an optional delay.
+
+```typescript
+import { fromError } from '@deessejs/fp';
+
+const result = await fromError(new Error('timeout'), 100);
+// Resolves to AsyncErr(Error: 'timeout') after 100 ms
+```
+
+---
+
+## Type guards
+
+These guards operate on the **inner value** obtained after `await`.
+
+### `isAsyncOk(result)`
+
+Narrows `AsyncResultInner<T, E>` to `AsyncOk<T>`.
+
+```typescript
+import { okAsync, isAsyncOk } from '@deessejs/fp';
+
+const inner = await okAsync(42);
+
+if (isAsyncOk(inner)) {
+  console.log(inner.value); // TypeScript knows: inner is AsyncOk<number>
+}
+```
+
+### `isAsyncErr(result)`
+
+Narrows `AsyncResultInner<T, E>` to `AsyncErr<E>`.
+
+```typescript
+import { errAsync, isAsyncErr } from '@deessejs/fp';
+
+const inner = await errAsync('not found');
+
+if (isAsyncErr(inner)) {
+  console.log(inner.error); // TypeScript knows: inner is AsyncErr<string>
+}
+```
+
+### `isAbortError(error)`
+
+Checks whether an unknown error is an `AbortError` produced by signal cancellation.
+
+```typescript
+import { isAbortError } from '@deessejs/fp';
+
+const inner = await fromPromiseWithOptions(fetch('/slow'), { signal });
+
+if (isAsyncErr(inner) && isAbortError(inner.error)) {
+  console.log('Request was cancelled');
+}
+```
+
+---
+
+## Transformations
+
+### `mapAsyncResult(result, fn)`
+
+Applies `fn` (sync or async) to the value inside `AsyncOk`. Passes `AsyncErr` through.
+
+```typescript
+import { okAsync, errAsync, mapAsyncResult } from '@deessejs/fp';
+
+// Sync transform
+const doubled = mapAsyncResult(okAsync(2), x => x * 2);
+const inner = await doubled;
+// AsyncOk(4)
+
+// Async transform
+const fetched = mapAsyncResult(okAsync(1), async id => {
+  const res = await fetch(`/api/users/${id}`);
+  return res.json();
+});
+```
+
+### `flatMapAsyncResult(result, fn)`
+
+Chains an operation that itself returns an `AsyncResult`. On `AsyncErr`, skips `fn` and propagates the error.
+
+```typescript
+import { fromPromise, flatMapAsyncResult, okAsync } from '@deessejs/fp';
+
+const fetchUser = (id: number) =>
+  fromPromise(fetch(`/api/users/${id}`).then(r => r.json()));
+
+const fetchOrders = (userId: number) =>
+  fromPromise(fetch(`/api/users/${userId}/orders`).then(r => r.json()));
+
+const result = await flatMapAsyncResult(
+  fetchUser(1),
+  user => flatMapAsyncResult(
+    fetchOrders(user.id),
+    orders => okAsync({ user, orders })
+  )
+);
+```
+
+### `mapErrAsyncResult(result, fn)`
+
+Transforms the error inside `AsyncErr`. Passes `AsyncOk` through.
+
+```typescript
+import { errAsync, mapErrAsyncResult } from '@deessejs/fp';
+
+const remapped = mapErrAsyncResult(
+  errAsync({ code: 404 }),
+  e => new Error(`HTTP ${e.code}`)
+);
+const inner = await remapped;
+// AsyncErr(Error: 'HTTP 404')
+```
+
+---
+
+## Extraction
+
+### `getOrElseAsyncResult(result, defaultValue)`
+
+Returns the value if `AsyncOk`, or `defaultValue` if `AsyncErr`.
+
+```typescript
+import { okAsync, errAsync, getOrElseAsyncResult } from '@deessejs/fp';
+
+await getOrElseAsyncResult(okAsync(42), 0);                    // 42
+await getOrElseAsyncResult(errAsync(new Error('x')), 0);       // 0
+```
+
+### `getOrComputeAsyncResult(result, fn)`
+
+Returns the value if `AsyncOk`, or awaits `fn()` for a computed fallback if `AsyncErr`.
+
+```typescript
+import { errAsync, getOrComputeAsyncResult } from '@deessejs/fp';
+
+await getOrComputeAsyncResult(
+  errAsync(new Error('cache miss')),
+  async () => fetchFromDatabase()
+);
+```
+
+---
+
+## Side effects
+
+### `tapAsyncResult(result, fn)`
+
+Runs `fn` on the value when `AsyncOk`, then returns the original `AsyncResult` unchanged.
+
+```typescript
+import { okAsync, tapAsyncResult } from '@deessejs/fp';
+
+await tapAsyncResult(okAsync(42), v => console.log('value:', v));
+// Logs: "value: 42"
+```
+
+### `tapErrAsyncResult(result, fn)`
+
+Runs `fn` on the error when `AsyncErr`, then returns the original `AsyncResult` unchanged.
+
+```typescript
+import { errAsync, tapErrAsyncResult } from '@deessejs/fp';
+
+await tapErrAsyncResult(
+  errAsync(new Error('timeout')),
+  e => console.error('Error:', e.message)
+);
+// Logs: "Error: timeout"
+```
+
+---
+
+## Pattern matching
+
+### `matchAsyncResult(result, okFn, errFn)`
+
+Exhaustively handles both `AsyncOk` and `AsyncErr`, returning a `Promise<U>`.
+
+```typescript
+import { okAsync, matchAsyncResult } from '@deessejs/fp';
+
+const message = await matchAsyncResult(
+  okAsync(42),
+  value => `Success: ${value}`,
+  error => `Failed: ${error.message}`
+);
+// "Success: 42"
+```
+
+---
+
+## Utilities
+
+### `unwrapAsyncResult(result)`
+
+Returns a `Promise<T>` that resolves to the value or **throws** the error. Use in tests or scripts; prefer explicit handling in production code.
+
+```typescript
+import { okAsync, errAsync, unwrapAsyncResult } from '@deessejs/fp';
+
+await unwrapAsyncResult(okAsync(42));                  // 42
+await unwrapAsyncResult(errAsync(new Error('oops'))); // throws
+```
+
+### `unwrapOrAsyncResult(result, defaultValue)`
+
+Returns a `Promise<T>` that resolves to the value or `defaultValue` on error.
+
+```typescript
+import { errAsync, unwrapOrAsyncResult } from '@deessejs/fp';
+
+await unwrapOrAsyncResult(errAsync(new Error('x')), 0); // 0
+```
+
+---
+
+## Combinators
+
+### `all(...results)`
+
+Runs all `AsyncResult` values in parallel. Returns `AsyncOk<T[]>` if every result succeeds, or the first `AsyncErr` encountered (fail-fast).
+
+```typescript
+import { fromPromise, all } from '@deessejs/fp';
+
+const result = await all(
+  fromPromise(fetch('/api/users/1').then(r => r.json())),
+  fromPromise(fetch('/api/users/2').then(r => r.json())),
+  fromPromise(fetch('/api/users/3').then(r => r.json()))
+);
+
+if (isAsyncOk(result)) {
+  const [u1, u2, u3] = result.value;
+}
+```
+
+### `allSettled(...results)`
+
+Like `all`, but never fails. Returns `AsyncOk<[T[], E[]]>` — a tuple of all values and all errors.
+
+```typescript
+import { okAsync, errAsync, allSettled, isAsyncOk } from '@deessejs/fp';
+
+const result = await allSettled(
+  okAsync(1),
+  errAsync(new Error('two failed')),
+  okAsync(3)
+);
+
+if (isAsyncOk(result)) {
+  const [values, errors] = result.value;
+  // values: [1, 3], errors: [Error: 'two failed']
+}
+```
+
+### `race(...results)`
+
+Resolves to the value of the first `AsyncResult` to complete. Throws if the first to complete is an error.
+
+```typescript
+import { fromValue, race } from '@deessejs/fp';
+
+const fast = fromValue('primary', 50);
+const slow = fromValue('fallback', 200);
+
+const winner = await race(fast, slow);
+// 'primary'
+```
+
+### `traverse(items, fn)`
+
+Maps each item in `items` to an `AsyncResult` using `fn`, runs all in parallel, and returns `AsyncResult<U[], E>`. Fails fast on the first error.
+
+```typescript
+import { fromPromise, traverse, isAsyncOk } from '@deessejs/fp';
+
+const userIds = [1, 2, 3, 4, 5];
+
+const result = await traverse(
+  userIds,
+  id => fromPromise(fetch(`/api/users/${id}`).then(r => r.json()))
+);
+
+if (isAsyncOk(result)) {
+  console.log('All users:', result.value);
+}
+```
+
+---
+
+## AbortSignal / cancellation
+
+`withSignal` wraps an existing `AsyncResult` chain so it resolves to `AsyncErr<AbortError>` as soon as the given `AbortSignal` is triggered.
+
+```typescript
+import { fromPromise, withSignal, isAsyncErr, isAbortError } from '@deessejs/fp';
+
+const controller = new AbortController();
+
+const result = withSignal(
+  fromPromise(fetch('/api/slow-operation')),
+  controller.signal
+);
+
+// Cancel after 3 seconds
+setTimeout(() => controller.abort(), 3000);
+
+const inner = await result;
+
+if (isAsyncErr(inner) && isAbortError(inner.error)) {
+  console.log('Operation was cancelled');
+}
+```
+
+You can also pass the signal directly to `fromPromise` for network-level cancellation:
+
+```typescript
+import { fromPromiseWithOptions } from '@deessejs/fp';
+
+const controller = new AbortController();
+
+const result = fromPromiseWithOptions(
+  fetch('/api/data', { signal: controller.signal }),
+  { signal: controller.signal }
+);
+```
+
+<Note>
+`fromPromiseWithOptions` cancels the `AsyncResult` via the signal. The underlying `fetch` call also needs the same signal passed to respect HTTP-level cancellation.
+</Note>
+
+---
+
+## Conversions
+
+### `toNullableAsyncResult(result)`
+
+Returns `Promise<T | null>`.
+
+```typescript
+import { okAsync, errAsync, toNullableAsyncResult } from '@deessejs/fp';
+
+await toNullableAsyncResult(okAsync(42));               // 42
+await toNullableAsyncResult(errAsync(new Error('x'))); // null
+```
+
+### `toUndefinedAsyncResult(result)`
+
+Returns `Promise<T | undefined>`.
+
+```typescript
+import { okAsync, errAsync, toUndefinedAsyncResult } from '@deessejs/fp';
+
+await toUndefinedAsyncResult(okAsync(42));               // 42
+await toUndefinedAsyncResult(errAsync(new Error('x'))); // undefined
+```
+
+---
+
+## Real-world example: chained API calls
+
+```typescript
+import {
+  fromPromise,
+  flatMapAsyncResult,
+  tapErrAsyncResult,
+  mapAsyncResult,
+  getOrElseAsyncResult,
+} from '@deessejs/fp';
+
+interface User    { id: number; name: string }
+interface Order   { id: number; total: number }
+interface Summary { user: User; orders: Order[]; totalSpend: number }
+
+const fetchUser = (id: number) =>
+  fromPromise(
+    fetch(`/api/users/${id}`).then(res => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json() as Promise<User>;
+    })
+  );
+
+const fetchOrders = (userId: number) =>
+  fromPromise(
+    fetch(`/api/users/${userId}/orders`).then(res => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json() as Promise<Order[]>;
+    })
+  );
+
+const getUserSummary = (userId: number) =>
+  flatMapAsyncResult(
+    tapErrAsyncResult(
+      fetchUser(userId),
+      e => console.error('User fetch failed:', e.message)
+    ),
+    user =>
+      mapAsyncResult(
+        tapErrAsyncResult(
+          fetchOrders(user.id),
+          e => console.error('Orders fetch failed:', e.message)
+        ),
+        orders => ({
+          user,
+          orders,
+          totalSpend: orders.reduce((sum, o) => sum + o.total, 0),
+        })
+      )
+  );
+
+// Usage
+const summary = await getOrElseAsyncResult(
+  getUserSummary(1),
+  { user: { id: 0, name: 'Guest' }, orders: [], totalSpend: 0 }
+);
+```
+
+---
+
+## Parallel operations
+
+Use `all` when you need every result and can fail fast:
+
+```typescript
+import { fromPromise, all, isAsyncOk } from '@deessejs/fp';
+
+const [profile, settings, notifications] = await all(
+  fromPromise(fetch('/api/profile').then(r => r.json())),
+  fromPromise(fetch('/api/settings').then(r => r.json())),
+  fromPromise(fetch('/api/notifications').then(r => r.json()))
+).then(inner => isAsyncOk(inner) ? inner.value : [null, null, null]);
+```
+
+Use `allSettled` when you want to collect partial results and handle errors per-item:
+
+```typescript
+import { fromPromise, allSettled, isAsyncOk } from '@deessejs/fp';
+
+const ids = [1, 2, 3, 4, 5];
+const results = await allSettled(
+  ...ids.map(id => fromPromise(fetch(`/api/items/${id}`).then(r => r.json())))
+);
+
+if (isAsyncOk(results)) {
+  const [items, errors] = results.value;
+  console.log(`${items.length} succeeded, ${errors.length} failed`);
+}
+```
+
+Use `traverse` when you have a dynamic list and want the same fail-fast behaviour as `all`:
+
+```typescript
+import { traverse, isAsyncOk } from '@deessejs/fp';
+
+const enriched = await traverse(
+  rawItems,
+  item => fromPromise(enrichItem(item))
+);
+```
+
+---
+
+## Related
+
+<CardGroup cols={3}>
+  <Card title="Result" icon="circle-check" href="/core/result">
+    Type-safe error handling in TypeScript.
+  </Card>
+  <Card title="Maybe" icon="circle-question" href="/core/maybe">
+    Optional values without null errors.
+  </Card>
+  <Card title="Try" icon="shield-halved" href="/core/try">
+    Wrap throwing functions safely.
+  </Card>
+</CardGroup>

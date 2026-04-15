@@ -1,0 +1,305 @@
+---
+title: "Resilience patterns: retry, timeout, and fallback"
+description: "Implement retry with exponential backoff, selective retry by error type, timeouts, jitter, fallback chains, and circuit-breaker-like patterns."
+keywords: ["retry", "exponential backoff", "timeout", "jitter", "fallback", "resilience", "retryAsync", "withTimeout", "addJitter"]
+---
+
+Production services fail transiently: networks hiccup, upstream services restart, rate limits kick in. The resilience utilities in `@deessejs/fp` — `retryAsync`, `withTimeout`, `exponentialBackoff`, and `addJitter` — give you composable building blocks to handle these failures without cluttering your business logic.
+
+## Retry with exponential backoff
+
+`retryAsync` takes an operation factory (a function that returns an `AsyncResult`) and an options object. The `'exponential'` backoff strategy doubles the delay between each attempt.
+
+```typescript
+import { retryAsync, fromPromise } from '@deessejs/fp';
+
+const fetchData = (url: string) =>
+  retryAsync(
+    () => fromPromise(fetch(url).then((r) => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json();
+    })),
+    {
+      attempts: 4,       // 1 initial attempt + 3 retries
+      delay: 500,        // base delay in milliseconds
+      backoff: 'exponential',
+      onRetry: (error, attempt) => {
+        console.warn(`Attempt ${attempt} failed: ${error.message}`);
+      },
+    }
+  );
+
+// Delay schedule: 500ms → 1000ms → 2000ms
+```
+
+<Tip>Set `attempts` to the total number of tries, including the first one. With `attempts: 4` and `backoff: 'exponential'`, you get delays of 500 ms, 1 000 ms, and 2 000 ms before the final failure is returned.</Tip>
+
+## Add jitter to avoid thundering herd
+
+When many clients retry at the same time after an outage, synchronized retries hammer the recovering service in waves. Jitter spreads the retries randomly across the delay window.
+
+```typescript
+import { retryAsync, addJitter, fromPromise } from '@deessejs/fp';
+
+const fetchWithJitter = (url: string) =>
+  retryAsync(
+    () => fromPromise(fetch(url).then((r) => r.json())),
+    {
+      attempts: 5,
+      delay: 1000,
+      backoff: 'exponential',
+      jitter: true,   // randomises each delay by ±50% of its computed value
+    }
+  );
+```
+
+You can also apply jitter manually to any delay value using `addJitter`:
+
+```typescript
+import { addJitter, sleep } from '@deessejs/fp';
+
+const baseDelay = 800; // ms
+const jittered = addJitter(baseDelay); // e.g. 640–960 ms
+await sleep(jittered);
+```
+
+## Selective retry by error type
+
+Not all errors are worth retrying. A `401 Unauthorized` will not succeed on a second attempt; a `503 Service Unavailable` might. Use `predicate` to control which errors trigger a retry.
+
+```typescript
+import { retryAsync, fromPromise } from '@deessejs/fp';
+
+type ApiError = {
+  type: 'network' | 'server' | 'client';
+  status?: number;
+};
+
+const fetchResilient = (url: string) =>
+  retryAsync(
+    () =>
+      fromPromise(
+        fetch(url).then(async (res) => {
+          if (!res.ok) {
+            const e: any = new Error(`HTTP ${res.status}`);
+            e.status = res.status;
+            throw e;
+          }
+          return res.json();
+        })
+      ).mapErrAsyncResult((e: any): ApiError => {
+        if (!e.status) return { type: 'network' };
+        if (e.status >= 500) return { type: 'server', status: e.status };
+        return { type: 'client', status: e.status };
+      }),
+    {
+      attempts: 4,
+      delay: 500,
+      backoff: 'exponential',
+      jitter: true,
+      predicate: (error) => {
+        // Only retry network errors and 5xx server errors
+        const typed = error as any;
+        if (!typed.status) return true;       // network error
+        return typed.status >= 500;            // server error
+        // 4xx client errors fall through → no retry
+      },
+    }
+  );
+```
+
+## Add a timeout
+
+`withTimeout` races a promise against a deadline. Wrap it in `fromPromise` so a timeout becomes an `Err` in your `AsyncResult` chain.
+
+```typescript
+import { withTimeout, fromPromise } from '@deessejs/fp';
+
+const fetchWithTimeout = (url: string, ms: number) =>
+  fromPromise(
+    withTimeout(
+      fetch(url).then((r) => r.json()),
+      ms,
+      { message: `Request to ${url} timed out after ${ms}ms`, name: 'TIMEOUT' }
+    )
+  );
+
+const result = await fetchWithTimeout('/api/data', 3000);
+```
+
+## Combine retry and timeout
+
+The most robust pattern wraps each attempt in a timeout, then retries the whole thing. Timeouts prevent a slow server from stalling your retry budget indefinitely.
+
+```typescript
+import { retryAsync, withTimeout, fromPromise } from '@deessejs/fp';
+
+const REQUEST_TIMEOUT_MS = 5_000;
+
+const fetchRobust = (url: string) =>
+  retryAsync(
+    () =>
+      fromPromise(
+        withTimeout(
+          fetch(url).then(async (res) => {
+            if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
+            return res.json();
+          }),
+          REQUEST_TIMEOUT_MS,
+          { message: 'Request timed out', name: 'TIMEOUT' }
+        )
+      ),
+    {
+      attempts: 3,
+      delay: 1000,
+      backoff: 'exponential',
+      jitter: true,
+      predicate: (e: any) => !e.status || e.status >= 500,
+      onRetry: (_error, attempt) =>
+        console.warn(`Retry ${attempt} for ${url}`),
+    }
+  );
+```
+
+## Fallback pattern
+
+Try a primary source, then fall back to a secondary if it fails. This is a manual pattern using `isAsyncErr` and `isAsyncOk`.
+
+```typescript
+import {
+  fromPromise,
+  isAsyncOk,
+  isAsyncErr,
+  okAsync,
+  errAsync,
+} from '@deessejs/fp';
+
+const fetchWithFallback = async (
+  primaryUrl: string,
+  fallbackUrl: string
+) => {
+  // Try primary
+  const primary = await fromPromise(
+    fetch(primaryUrl).then((r) => {
+      if (!r.ok) throw new Error(`Primary failed: HTTP ${r.status}`);
+      return r.json();
+    })
+  );
+
+  if (isAsyncOk(primary)) return okAsync(primary.value);
+
+  // Primary failed — try fallback
+  console.warn('Primary failed, trying fallback');
+  const fallback = await fromPromise(
+    fetch(fallbackUrl).then((r) => {
+      if (!r.ok) throw new Error(`Fallback failed: HTTP ${r.status}`);
+      return r.json();
+    })
+  );
+
+  if (isAsyncOk(fallback)) return okAsync(fallback.value);
+
+  // Both failed — return the fallback error
+  return errAsync(new Error('Both primary and fallback failed'));
+};
+```
+
+## Circuit-breaker-like pattern
+
+A true circuit breaker needs shared mutable state across requests. You can approximate open/half-open/closed behaviour by tracking consecutive failures and skipping retries once a threshold is crossed.
+
+```typescript
+import { retryAsync, fromPromise } from '@deessejs/fp';
+
+class CircuitBreaker {
+  private failures = 0;
+  private lastFailure = 0;
+
+  constructor(
+    private readonly threshold: number,
+    private readonly resetMs: number
+  ) {}
+
+  isOpen(): boolean {
+    if (this.failures < this.threshold) return false;
+    // Auto-reset after cooldown period
+    if (Date.now() - this.lastFailure > this.resetMs) {
+      this.failures = 0;
+      return false;
+    }
+    return true;
+  }
+
+  recordFailure() {
+    this.failures++;
+    this.lastFailure = Date.now();
+  }
+
+  recordSuccess() {
+    this.failures = 0;
+  }
+}
+
+const breaker = new CircuitBreaker(5, 30_000); // open after 5 failures, reset after 30s
+
+const fetchGuarded = (url: string) => {
+  if (breaker.isOpen()) {
+    return errAsync(new Error('Circuit breaker open — too many recent failures'));
+  }
+
+  return retryAsync(
+    () =>
+      fromPromise(
+        fetch(url).then((r) => {
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          return r.json();
+        })
+      ),
+    {
+      attempts: 3,
+      delay: 500,
+      backoff: 'exponential',
+      jitter: true,
+      predicate: (e: any) => !e.status || e.status >= 500,
+      onRetry: (_e, attempt) => {
+        if (attempt === 3) breaker.recordFailure();
+      },
+    }
+  ).tapAsyncResult(() => breaker.recordSuccess());
+};
+```
+
+<Note>
+  This pattern approximates circuit-breaker behavior using `retryAsync` options. For a full production circuit breaker with shared state across concurrent requests, consider a dedicated library or a service mesh feature.
+</Note>
+
+## Linear and constant backoff
+
+When you need predictable retry timing rather than exponential growth, use `'linear'` or `'constant'` backoff.
+
+```typescript
+import { retryAsync, fromPromise } from '@deessejs/fp';
+
+// Linear: 300ms, 600ms, 900ms, 1200ms
+const withLinearBackoff = (op: () => AsyncResultInner<unknown, Error>) =>
+  retryAsync(op, { attempts: 4, delay: 300, backoff: 'linear' });
+
+// Constant: 1000ms, 1000ms, 1000ms
+const withConstantBackoff = (op: () => AsyncResultInner<unknown, Error>) =>
+  retryAsync(op, { attempts: 3, delay: 1000, backoff: 'constant' });
+```
+
+<CardGroup cols={2}>
+  <Card title="Retry utilities" icon="rotate-right" href="/utilities/retry">
+    Full `retryAsync` API: all options, backoff strategies, and `RetryOptions` type.
+  </Card>
+  <Card title="Sleep utilities" icon="clock" href="/utilities/sleep">
+    `sleep`, `withTimeout`, `addJitter`, and `sleepWithSignal` reference.
+  </Card>
+  <Card title="HTTP API calls" icon="cloud" href="/examples/http-api">
+    Typed fetch wrapper with retry and timeout wired together end-to-end.
+  </Card>
+  <Card title="AsyncResult" icon="bolt" href="/core/async-result">
+    Core async primitives: `fromPromise`, `mapAsyncResult`, `flatMapAsyncResult`.
+  </Card>
+</CardGroup>

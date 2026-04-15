@@ -1,0 +1,248 @@
+---
+title: "Database operations with Result and Maybe"
+description: "Model database queries, nullable lookups, constraint violations, and transaction chains with Result, Maybe, and AsyncResult — no ORM required."
+keywords: ["database", "Maybe", "Result", "fromNullable", "toResult", "flatMapResult", "AsyncResult", "transaction"]
+---
+
+Database operations involve two distinct failure modes: a row might simply not exist (a normal outcome, not a bug), or something might go wrong during the operation (a connection drop, a constraint violation). `Maybe` models the first case, `Result` models the second, and `AsyncResult` wraps both in a typed async wrapper.
+
+## Define your error type
+
+```typescript
+import { Result, Maybe, AsyncResultInner } from '@deessejs/fp';
+
+type DatabaseError =
+  | { type: 'NOT_FOUND'; message: string }
+  | { type: 'CONSTRAINT'; message: string }
+  | { type: 'CONNECTION'; message: string }
+  | { type: 'QUERY'; message: string };
+
+type User = { id: number; name: string; email: string; createdAt: Date };
+type Post = { id: number; userId: number; title: string; content: string };
+```
+
+## Query that might return nothing
+
+When a row may or may not exist, your query returns `Maybe<User>`. Use `fromNullable` to lift a nullable result into the `Maybe` type.
+
+```typescript
+import { fromNullable, isSome, isNone } from '@deessejs/fp';
+
+// Imagine this is your DB adapter
+interface DbAdapter {
+  query<T>(sql: string, params: unknown[]): Promise<T | null>;
+}
+
+const findUserById = async (
+  db: DbAdapter,
+  id: number
+): Promise<Maybe<User>> => {
+  const row = await db.query<User>('SELECT * FROM users WHERE id = $1', [id]);
+  return fromNullable(row);
+};
+
+// Usage
+const maybeUser = await findUserById(db, 42);
+
+if (isSome(maybeUser)) {
+  console.log(maybeUser.value.name);
+} else {
+  console.log('User not found');
+}
+```
+
+## Convert Maybe to Result when context matters
+
+`toResult` (from conversions) promotes a `Maybe` to a `Result` when you need to carry an error message further down a chain.
+
+```typescript
+import { fromNullable, toResultMaybe } from '@deessejs/fp';
+
+const requireUser = async (
+  db: DbAdapter,
+  id: number
+): Promise<Result<User, DatabaseError>> => {
+  const row = await db.query<User>('SELECT * FROM users WHERE id = $1', [id]);
+  const maybeUser = fromNullable(row);
+  return toResultMaybe(maybeUser, (): DatabaseError => ({
+    type: 'NOT_FOUND',
+    message: `User ${id} not found`,
+  }));
+};
+```
+
+<Tip>Use `Maybe` at the data layer where "no row" is a normal outcome, and promote to `Result` at the service layer where callers need to distinguish "not found" from other errors.</Tip>
+
+## Insert with typed constraint errors
+
+`fromPromise` catches thrown errors from the database driver and lets you map them to specific `DatabaseError` variants.
+
+```typescript
+import { fromPromise } from '@deessejs/fp';
+
+const createUser = (
+  db: DbAdapter,
+  name: string,
+  email: string
+): AsyncResultInner<User, DatabaseError> =>
+  fromPromise(
+    db.query<User>(
+      'INSERT INTO users (name, email) VALUES ($1, $2) RETURNING *',
+      [name, email]
+    ) as Promise<User>
+  ).mapErrAsyncResult((e: any): DatabaseError => {
+    // PostgreSQL unique-violation code
+    if (e.code === '23505') {
+      return { type: 'CONSTRAINT', message: 'A user with this email already exists' };
+    }
+    if (e.code === 'ECONNREFUSED') {
+      return { type: 'CONNECTION', message: 'Database connection refused' };
+    }
+    return { type: 'QUERY', message: e.message };
+  });
+```
+
+## Chain operations: fetch then insert
+
+`flatMapAsyncResult` chains two operations so that the second only runs when the first succeeds. The error type is automatically widened to `DatabaseError` across the chain.
+
+```typescript
+import { flatMapAsyncResult, okAsync } from '@deessejs/fp';
+
+const createPost = (
+  db: DbAdapter,
+  userId: number,
+  title: string,
+  content: string
+): AsyncResultInner<Post, DatabaseError> =>
+  fromPromise(
+    db.query<User>('SELECT id FROM users WHERE id = $1', [userId]) as Promise<User | null>
+  )
+    .mapErrAsyncResult((e: any): DatabaseError => ({ type: 'CONNECTION', message: e.message }))
+    .flatMapAsyncResult(async (maybeUser) => {
+      if (!maybeUser) {
+        return errAsync<Post, DatabaseError>({ type: 'NOT_FOUND', message: `User ${userId} not found` });
+      }
+      return createPostRow(db, userId, title, content);
+    });
+
+const createPostRow = (
+  db: DbAdapter,
+  userId: number,
+  title: string,
+  content: string
+): AsyncResultInner<Post, DatabaseError> =>
+  fromPromise(
+    db.query<Post>(
+      'INSERT INTO posts (user_id, title, content) VALUES ($1, $2, $3) RETURNING *',
+      [userId, title, content]
+    ) as Promise<Post>
+  ).mapErrAsyncResult((e: any): DatabaseError => ({ type: 'QUERY', message: e.message }));
+```
+
+## Transaction pattern
+
+For multi-step writes that must succeed or fail together, wrap the entire transaction in `fromPromise` and use `flatMapResult` to sequence the individual steps inside it.
+
+```typescript
+import { ok, err, isErr, flatMapResult } from '@deessejs/fp';
+
+interface TransactionalDb extends DbAdapter {
+  transaction<T>(fn: (tx: DbAdapter) => Promise<T>): Promise<T>;
+}
+
+const transferPoints = async (
+  db: TransactionalDb,
+  fromId: number,
+  toId: number,
+  points: number
+): AsyncResultInner<void, DatabaseError> =>
+  fromPromise(
+    db.transaction(async (tx) => {
+      const sender = await tx.query<User>('SELECT * FROM users WHERE id = $1', [fromId]);
+      if (!sender) throw Object.assign(new Error('Sender not found'), { code: 'NOT_FOUND' });
+
+      const receiver = await tx.query<User>('SELECT * FROM users WHERE id = $1', [toId]);
+      if (!receiver) throw Object.assign(new Error('Receiver not found'), { code: 'NOT_FOUND' });
+
+      await tx.query(
+        'UPDATE users SET points = points - $1 WHERE id = $2',
+        [points, fromId]
+      );
+      await tx.query(
+        'UPDATE users SET points = points + $1 WHERE id = $2',
+        [points, toId]
+      );
+    })
+  ).mapErrAsyncResult((e: any): DatabaseError => {
+    if (e.code === 'NOT_FOUND') return { type: 'NOT_FOUND', message: e.message };
+    if (e.code === '23514') return { type: 'CONSTRAINT', message: 'Insufficient points' };
+    return { type: 'QUERY', message: e.message };
+  });
+```
+
+## Validate multiple preconditions with allResult
+
+Use `allResult` when you need several independent checks to pass before proceeding. It returns the first `Err` it encounters.
+
+```typescript
+import { ok, err, allResult, isErr } from '@deessejs/fp';
+
+const canPublishPost = (
+  user: User,
+  post: Post,
+  now: Date
+): Result<void, DatabaseError> => {
+  const checks = allResult(
+    user.id === post.userId
+      ? ok(undefined)
+      : err<undefined, DatabaseError>({ type: 'CONSTRAINT', message: 'Post does not belong to user' }),
+    post.title.length >= 5
+      ? ok(undefined)
+      : err<undefined, DatabaseError>({ type: 'CONSTRAINT', message: 'Title is too short' }),
+    now > user.createdAt
+      ? ok(undefined)
+      : err<undefined, DatabaseError>({ type: 'CONSTRAINT', message: 'Invalid account creation date' })
+  );
+
+  return isErr(checks) ? checks : ok(undefined);
+};
+```
+
+## Read a JSON column safely
+
+Use `attempt` to guard against malformed JSON stored in a text column, mapping the thrown `SyntaxError` to a typed `DatabaseError`.
+
+```typescript
+import { attempt, mapErr } from '@deessejs/fp';
+
+type UserSettings = { theme: string; locale: string };
+
+const parseUserSettings = (raw: string): Result<UserSettings, DatabaseError> =>
+  mapErr(
+    attempt(() => JSON.parse(raw) as UserSettings),
+    (e): DatabaseError => ({
+      type: 'QUERY',
+      message: `Invalid settings JSON: ${e.message}`,
+    })
+  );
+```
+
+<Note>
+  `attempt` wraps a synchronous function that might throw. Use it any time you call `JSON.parse`, unsafe casts, or third-party code you do not control.
+</Note>
+
+<CardGroup cols={2}>
+  <Card title="Maybe" icon="circle-question" href="/core/maybe">
+    Full reference for `fromNullable`, `toResultMaybe`, `matchMaybe`, and friends.
+  </Card>
+  <Card title="Result" icon="circle-check" href="/core/result">
+    `allResult`, `flatMapResult`, `mapErr`, and the full Result API.
+  </Card>
+  <Card title="AsyncResult" icon="bolt" href="/core/async-result">
+    Wrapping async DB calls with `fromPromise` and chaining with `flatMapAsyncResult`.
+  </Card>
+  <Card title="Form validation" icon="list-check" href="/examples/form-validation">
+    Use the same `Result` composition patterns for sync input validation.
+  </Card>
+</CardGroup>

@@ -1,0 +1,251 @@
+---
+title: "HTTP API calls with AsyncResult"
+description: "Build a typed API client that wraps fetch with AsyncResult, chains requests, runs parallel calls, and handles typed network errors exhaustively."
+keywords: ["AsyncResult", "fetch", "fromPromise", "HTTP", "API client", "parallel", "timeout", "retry"]
+---
+
+Unhandled promise rejections and invisible error types are the two most common problems with async API code. `AsyncResult` solves both: every `fetch` call becomes a typed value that the compiler tracks, and every error variant is a first-class type you must handle.
+
+## Define your error union
+
+A discriminated union forces you to handle every failure mode at the call site.
+
+```typescript
+import { AsyncResultInner } from '@deessejs/fp';
+
+type NetworkError = {
+  type: 'network';
+  message: string;
+};
+
+type NotFoundError = {
+  type: 'not_found';
+  id: number;
+};
+
+type UnauthorizedError = {
+  type: 'unauthorized';
+};
+
+type ServerError = {
+  type: 'server';
+  status: number;
+};
+
+type ApiError = NetworkError | NotFoundError | UnauthorizedError | ServerError;
+```
+
+## Wrap fetch with fromPromise
+
+`fromPromise` catches any rejection and converts it to an `Err`. Map the raw `Error` to your typed union inside `mapErrAsyncResult`.
+
+```typescript
+import { fromPromise, okAsync } from '@deessejs/fp';
+
+type User = { id: number; name: string; email: string };
+type Order = { id: number; userId: number; total: number };
+
+const fetchUser = (id: number): AsyncResultInner<User, ApiError> =>
+  fromPromise(
+    fetch(`/api/users/${id}`).then(async (res) => {
+      if (res.status === 401) throw Object.assign(new Error('Unauthorized'), { status: 401 });
+      if (res.status === 404) throw Object.assign(new Error('Not found'), { status: 404, id });
+      if (!res.ok) throw Object.assign(new Error(`Server error`), { status: res.status });
+      return res.json() as Promise<User>;
+    })
+  ).mapErrAsyncResult((e: any): ApiError => {
+    if (e.status === 401) return { type: 'unauthorized' };
+    if (e.status === 404) return { type: 'not_found', id: e.id ?? id };
+    if (e.status) return { type: 'server', status: e.status };
+    return { type: 'network', message: e.message };
+  });
+```
+
+<Tip>Throw from inside the `fetch` chain rather than returning an `Err` directly — `fromPromise` catches everything, so keeping the mapping in one `mapErrAsyncResult` call keeps the function readable.</Tip>
+
+## Chain requests sequentially
+
+Use `flatMapAsyncResult` to feed the result of one request into the next. The second request only runs when the first succeeds.
+
+```typescript
+import { flatMapAsyncResult, okAsync } from '@deessejs/fp';
+
+const fetchOrders = (userId: number): AsyncResultInner<Order[], ApiError> =>
+  fromPromise(
+    fetch(`/api/users/${userId}/orders`).then(async (res) => {
+      if (res.status === 401) throw Object.assign(new Error('Unauthorized'), { status: 401 });
+      if (!res.ok) throw Object.assign(new Error('Server error'), { status: res.status });
+      return res.json() as Promise<Order[]>;
+    })
+  ).mapErrAsyncResult((e: any): ApiError => {
+    if (e.status === 401) return { type: 'unauthorized' };
+    if (e.status) return { type: 'server', status: e.status };
+    return { type: 'network', message: e.message };
+  });
+
+// Fetch user → then fetch their orders
+const getUserOrders = (
+  userId: number
+): AsyncResultInner<{ user: User; orders: Order[] }, ApiError> =>
+  flatMapAsyncResult(fetchUser(userId), (user) =>
+    flatMapAsyncResult(fetchOrders(user.id), (orders) =>
+      okAsync({ user, orders })
+    )
+  );
+```
+
+## Run requests in parallel
+
+Use `all` when the requests are independent. All three start simultaneously — the result is available only when every request succeeds.
+
+```typescript
+import { all, fromPromise } from '@deessejs/fp';
+
+type UserStats = { postsCount: number; followersCount: number };
+type Notification = { id: number; message: string };
+
+const fetchDashboard = async (userId: number) => {
+  const [user, stats, notifications] = await all(
+    fetchUser(userId),
+    fromPromise(fetch(`/api/users/${userId}/stats`).then((r) => r.json() as Promise<UserStats>)),
+    fromPromise(fetch(`/api/users/${userId}/notifications`).then((r) => r.json() as Promise<Notification[]>))
+  );
+
+  return { user, stats, notifications };
+};
+```
+
+<Warning>
+  `all` throws if any operation fails — this is a known limitation of the current API. Until a future version returns `Result<T[], E[]>`, wrap calls in a try/catch or use sequential `flatMapAsyncResult` chains when you need guaranteed error capture.
+</Warning>
+
+## Map over a list in parallel
+
+`traverse` is `Promise.all` with typed errors — it applies an async function to every item and either resolves with an array of all values or throws on the first failure.
+
+```typescript
+import { traverse } from '@deessejs/fp';
+
+const fetchAllUsers = (ids: number[]) =>
+  traverse(ids, (id) => fetchUser(id));
+
+// Fetches all users in parallel
+// Type: Promise<User[]>
+const users = await fetchAllUsers([1, 2, 3, 4, 5]);
+```
+
+## Add a timeout
+
+`withTimeout` races your promise against a deadline. Wrap it inside `fromPromise` so a timeout becomes an `Err` like any other error.
+
+```typescript
+import { fromPromise, withTimeout } from '@deessejs/fp';
+
+const fetchUserWithTimeout = (
+  id: number,
+  timeoutMs: number
+): AsyncResultInner<User, ApiError> =>
+  fromPromise(
+    withTimeout(
+      fetch(`/api/users/${id}`).then((r) => r.json() as Promise<User>),
+      timeoutMs,
+      { message: 'Request timed out', name: 'TIMEOUT' }
+    )
+  ).mapErrAsyncResult((e: any): ApiError => {
+    if (e.name === 'TIMEOUT') return { type: 'network', message: e.message };
+    return { type: 'network', message: e.message };
+  });
+```
+
+## Retry on transient failures
+
+Combine `retryAsync` and `withTimeout` for a fully resilient call. The `predicate` option lets you skip retrying on 4xx errors — retrying a 404 or 401 will never succeed.
+
+```typescript
+import { retryAsync, fromPromise, withTimeout } from '@deessejs/fp';
+
+const fetchUserResilient = (id: number): AsyncResultInner<User, ApiError> =>
+  retryAsync(
+    () =>
+      fromPromise(
+        withTimeout(
+          fetch(`/api/users/${id}`).then(async (res) => {
+            if (!res.ok) {
+              const e: any = new Error(`HTTP ${res.status}`);
+              e.status = res.status;
+              throw e;
+            }
+            return res.json() as Promise<User>;
+          }),
+          5000,
+          { message: 'Request timed out', name: 'TIMEOUT' }
+        )
+      ).mapErrAsyncResult((e: any): ApiError => {
+        if (e.status === 404) return { type: 'not_found', id };
+        if (e.status === 401) return { type: 'unauthorized' };
+        if (e.status) return { type: 'server', status: e.status };
+        return { type: 'network', message: e.message };
+      }),
+    {
+      attempts: 3,
+      delay: 500,
+      backoff: 'exponential',
+      jitter: true,
+      // Only retry network and 5xx errors — not 4xx client errors
+      predicate: (error) => {
+        const typed = error as any;
+        const status = typed?.status as number | undefined;
+        if (!status) return true; // network error, retry
+        return status >= 500;     // server error, retry
+      },
+    }
+  );
+```
+
+## Handle errors at the call site
+
+`matchAsyncResult` is the cleanest way to branch on success and failure. The compiler enforces exhaustive handling of every error variant via the `switch`.
+
+```typescript
+import { matchAsyncResult } from '@deessejs/fp';
+
+async function loadUserPage(userId: number) {
+  const result = await fetchUserResilient(userId);
+
+  return matchAsyncResult(
+    result,
+    (user) => ({ status: 200, body: user }),
+    (error) => {
+      switch (error.type) {
+        case 'not_found':
+          return { status: 404, body: `User ${error.id} not found` };
+        case 'unauthorized':
+          return { status: 401, body: 'Authentication required' };
+        case 'server':
+          return { status: 502, body: `Upstream error: ${error.status}` };
+        case 'network':
+          return { status: 503, body: `Network error: ${error.message}` };
+      }
+    }
+  );
+}
+```
+
+<Note>
+  TypeScript will warn you if you add a new variant to `ApiError` but forget to handle it in the `switch` — that is the main benefit of discriminated unions over plain `Error` objects.
+</Note>
+
+<CardGroup cols={2}>
+  <Card title="AsyncResult" icon="bolt" href="/core/async-result">
+    Full reference for `fromPromise`, `flatMapAsyncResult`, `all`, `traverse`, and `matchAsyncResult`.
+  </Card>
+  <Card title="Retry and sleep" icon="rotate-right" href="/utilities/retry">
+    Full `retryAsync` options: attempts, backoff, jitter, predicate, and `onRetry`.
+  </Card>
+  <Card title="Resilience patterns" icon="shield-check" href="/examples/resilience">
+    Deep dive into retry, timeout, fallback, and circuit-breaker-like patterns.
+  </Card>
+  <Card title="Database operations" icon="database" href="/examples/database">
+    Apply `AsyncResult` to database queries and transaction chains.
+  </Card>
+</CardGroup>

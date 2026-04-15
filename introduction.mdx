@@ -1,0 +1,101 @@
+---
+title: "Introduction to @deessejs/fp"
+description: "A zero-dependency TypeScript library for explicit error handling using Result, Maybe, Try, and AsyncResult monads with full type inference."
+keywords: ["typescript", "result", "maybe", "error handling", "functional programming", "monads"]
+---
+
+`@deessejs/fp` is a TypeScript library that brings explicit error handling to your codebase. Instead of relying on exceptions that disappear from your type signatures, it gives you four composable types — `Result`, `Maybe`, `Try`, and `AsyncResult` — that make every possible failure visible to the compiler. You get the safety of typed errors without the weight of a full FP framework.
+
+## The problem with try/catch
+
+TypeScript promises type safety, but `try/catch` breaks that promise. When a function throws, its return type hides the failure. Callers have no idea an error is possible until it crashes in production.
+
+<CodeGroup>
+
+```typescript Without @deessejs/fp
+// The type says User, but this can throw at runtime
+function parseUser(data: string): User {
+  return JSON.parse(data) // No error in the type signature
+}
+
+// Callers must remember to wrap in try/catch — or not
+const user = parseUser(rawInput) // What if this throws?
+console.log(user.name) // Crash waiting to happen
+```
+
+```typescript With @deessejs/fp
+import { ok, err, isOk, Result } from '@deessejs/fp'
+
+class ParseError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ParseError'
+  }
+}
+
+// The type signature tells you exactly what can go wrong
+function parseUser(data: string): Result<User, ParseError> {
+  try {
+    return ok(JSON.parse(data))
+  } catch (e) {
+    return err(new ParseError(String(e)))
+  }
+}
+
+// TypeScript forces you to handle both cases
+const result = parseUser(rawInput)
+if (isOk(result)) {
+  console.log(result.value.name) // TypeScript knows value exists
+} else {
+  console.error(result.error.message) // TypeScript knows error exists
+}
+```
+
+</CodeGroup>
+
+With `@deessejs/fp`, errors become part of the type. You cannot ignore them — TypeScript won't let you access the success value without first checking which branch you're in.
+
+## Core types
+
+<CardGroup cols={2}>
+  <Card title="Result" icon="circle-check" href="/core/result">
+    Represents an operation that can succeed (`Ok`) or fail (`Err`). Use for parsing, API calls, validation, and any operation that can produce a typed error.
+  </Card>
+  <Card title="Maybe" icon="circle-question" href="/core/maybe">
+    Represents a value that may or may not be present (`Some` or `None`). The safe alternative to `null` and `undefined`.
+  </Card>
+  <Card title="Try" icon="shield" href="/core/try">
+    Wraps any synchronous or asynchronous function that can throw, capturing the thrown value as a typed error without changing the call site.
+  </Card>
+  <Card title="AsyncResult" icon="bolt" href="/core/async-result">
+    A `Promise`-based wrapper for `Result` that lets you chain async operations with full error safety and cancellation support.
+  </Card>
+</CardGroup>
+
+## Key features
+
+<Note>
+  `@deessejs/fp` ships with zero runtime dependencies. Zod is an optional peer dependency for structured error validation.
+</Note>
+
+- **Explicit errors in type signatures** — callers always know what can fail
+- **Exhaustive pattern matching** — `matchResult` and `matchMaybe` ensure every branch is handled
+- **Composable transforms** — `mapResult`, `flatMapResult`, `allResult`, and more for building pipelines
+- **Async-first** — `AsyncResult` and `attemptAsync` cover the full async lifecycle with abort signal support
+- **Retry and resilience** — built-in `retryAsync` with exponential, linear, and constant backoff strategies
+- **Structured error system** — typed `error()` builder with chaining, groups, and context
+- **Pipe and flow utilities** — `pipe` and `flow` for composing transformations without intermediate variables
+- **Zero runtime dependencies** — the full library adds roughly 2 KB to your bundle
+- **`Unit` type** — `unit` and `isUnit` represent void operations (like `Result<Unit, E>`) without using `undefined`
+
+## Requirements
+
+| Requirement | Version |
+|-------------|---------|
+| TypeScript | 5.0 or later |
+| Node.js | 20 or later |
+| Zod (optional) | 4.0 or later |
+
+<Tip>
+  Strict mode is strongly recommended. Enable `"strict": true` in your `tsconfig.json` to get the full benefit of `@deessejs/fp`'s type narrowing.
+</Tip>

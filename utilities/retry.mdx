@@ -1,0 +1,340 @@
+---
+title: "Retry failed operations with backoff strategies"
+description: "Retry async operations on transient failures with exponential, linear, or constant backoff. Supports predicate filtering, jitter, and AbortSignal cancellation."
+---
+
+Network calls fail. Databases hiccup. External APIs rate-limit. Most of these failures are transient — they succeed on the next attempt. `retryAsync` handles the retry loop so you don't have to: it calls your function, waits with a configurable backoff between attempts, and rethrows only when all attempts are exhausted or the error is not retryable.
+
+## Quick start
+
+```typescript
+import { retryAsync } from '@deessejs/fp';
+
+const user = await retryAsync(
+  () => fetch(`/api/users/${id}`).then(r => r.json()),
+  { attempts: 3, delay: 500, backoff: 'exponential' },
+);
+// Attempts at t=0, t=500ms, t=1000ms
+```
+
+## API reference
+
+### `retryAsync(fn, options)` — retry an async function
+
+Executes `fn` up to `options.attempts` times. On each failure it checks the optional `predicate`, calls `onRetry`, waits for the calculated delay (with optional jitter), then tries again. Resolves with the first successful return value, or rejects with the last error.
+
+<ParamField body="fn" type="() => Promise<T>" required>
+  The async function to attempt. Called fresh on each attempt — no caching of partial results.
+</ParamField>
+
+<ParamField body="options" type="RetryOptions">
+  Configuration object. All fields are optional with safe defaults.
+</ParamField>
+
+```typescript
+import { retryAsync } from '@deessejs/fp';
+
+const result = await retryAsync(
+  async () => {
+    const res = await fetch('/api/data');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  },
+  {
+    attempts: 4,
+    delay: 1000,
+    backoff: 'exponential',
+    jitter: true,
+    predicate: err => !err.message.includes('404'),
+    onRetry: (err, attempt) => console.warn(`Attempt ${attempt} failed:`, err.message),
+  },
+);
+```
+
+### `RetryOptions` — full options reference
+
+```typescript
+interface RetryOptions {
+  /** Total number of attempts including the first call. Default: 3 */
+  attempts?: number;
+
+  /** Base delay in milliseconds between attempts. Default: 1000 */
+  delay?: number;
+
+  /** Backoff strategy. Default: 'exponential' */
+  backoff?: 'exponential' | 'linear' | 'constant' | ((attempt: number, delay: number) => number);
+
+  /** Cap the calculated delay at this value in milliseconds. */
+  maxDelay?: number;
+
+  /** Return false to stop retrying immediately. Default: always retry */
+  predicate?: (error: Error) => boolean;
+
+  /** Called after each failed attempt, before sleeping. */
+  onRetry?: (error: Error, attempt: number) => void;
+
+  /** Add randomness to delays to prevent thundering herd. Default: false */
+  jitter?: boolean;
+
+  /** AbortSignal — abort signal cancels the retry loop. */
+  signal?: AbortSignal;
+}
+```
+
+<Note>
+`attempts` is the **total** number of calls including the first. `attempts: 3` means one initial call and two retries.
+</Note>
+
+### Backoff helpers
+
+Three named functions are exported for use as custom `backoff` values or standalone delay calculators:
+
+```typescript
+import { exponentialBackoff, linearBackoff, constantBackoff } from '@deessejs/fp';
+
+// delay * 2^(attempt-1)
+exponentialBackoff(1, 1000); // 1000
+exponentialBackoff(2, 1000); // 2000
+exponentialBackoff(3, 1000); // 4000
+
+// delay * attempt
+linearBackoff(1, 1000);      // 1000
+linearBackoff(2, 1000);      // 2000
+linearBackoff(3, 1000);      // 3000
+
+// always delay
+constantBackoff(1, 1000);    // 1000
+constantBackoff(5, 1000);    // 1000
+```
+
+## Backoff strategies
+
+<Tabs>
+  <Tab title="Exponential (default)">
+    Delays double with each attempt. Best for most cases — backs off quickly to avoid hammering a struggling service.
+
+    ```typescript
+    await retryAsync(fn, {
+      attempts: 4,
+      delay: 1000,
+      backoff: 'exponential',
+    });
+    // Attempt 1 at t=0
+    // Attempt 2 at t=1000ms  (1000 × 2^0)
+    // Attempt 3 at t=3000ms  (1000 × 2^1)
+    // Attempt 4 at t=7000ms  (1000 × 2^2)
+    ```
+  </Tab>
+  <Tab title="Linear">
+    Delays grow by one base unit per attempt. Predictable, suitable when you need steady load on the retried service.
+
+    ```typescript
+    await retryAsync(fn, {
+      attempts: 4,
+      delay: 1000,
+      backoff: 'linear',
+    });
+    // Attempt 1 at t=0
+    // Attempt 2 at t=1000ms  (1000 × 1)
+    // Attempt 3 at t=3000ms  (1000 × 2)
+    // Attempt 4 at t=6000ms  (1000 × 3)
+    ```
+  </Tab>
+  <Tab title="Constant">
+    Same delay every time. Good for third-party APIs with known rate-limit windows.
+
+    ```typescript
+    await retryAsync(fn, {
+      attempts: 5,
+      delay: 2000,
+      backoff: 'constant',
+    });
+    // Attempts at t=0, t=2s, t=4s, t=6s, t=8s
+    ```
+  </Tab>
+  <Tab title="Custom function">
+    Provide `(attempt, baseDelay) => number` for full control. The `attempt` argument is 1-indexed.
+
+    ```typescript
+    // Fibonacci backoff
+    await retryAsync(fn, {
+      delay: 1000,
+      backoff: (attempt, delay) => {
+        const fib = [1, 1, 2, 3, 5, 8, 13];
+        return delay * (fib[attempt - 1] ?? fib[fib.length - 1]);
+      },
+    });
+    ```
+  </Tab>
+</Tabs>
+
+### Backoff strategy comparison
+
+| Strategy | Delays (base=1000ms) | Best for |
+|----------|----------------------|----------|
+| `exponential` | 1s, 2s, 4s, 8s… | General-purpose — most API calls |
+| `linear` | 1s, 2s, 3s, 4s… | Predictable, gradual load distribution |
+| `constant` | 1s, 1s, 1s, 1s… | Rate-limited APIs with fixed windows |
+| custom | any | Fibonacci, decorrelated jitter, domain-specific |
+
+### Capping delay with `maxDelay`
+
+Exponential backoff can grow large. Use `maxDelay` to cap the computed delay regardless of the formula:
+
+```typescript
+await retryAsync(fn, {
+  attempts: 10,
+  delay: 500,
+  backoff: 'exponential',
+  maxDelay: 10_000, // never wait more than 10 seconds
+});
+// Delays: 500ms, 1s, 2s, 4s, 8s, 10s, 10s, 10s, 10s
+```
+
+## Selective retry with `predicate`
+
+Not all errors warrant a retry. Client errors (4xx), validation failures, and auth errors should propagate immediately. Use `predicate` to allow retries only for transient errors.
+
+```typescript
+import { retryAsync } from '@deessejs/fp';
+
+const isTransient = (err: Error) => {
+  const msg = err.message;
+  // Retry on network problems or server errors
+  if (msg.includes('ETIMEDOUT') || msg.includes('ECONNRESET')) return true;
+  if (msg.includes('HTTP 5')) return true;
+  // Never retry on client errors
+  if (msg.includes('HTTP 4')) return false;
+  return true;
+};
+
+const data = await retryAsync(
+  async () => {
+    const res = await fetch('/api/resource');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  },
+  { attempts: 3, predicate: isTransient },
+);
+```
+
+## Logging retries with `onRetry`
+
+`onRetry` receives the error and the attempt number (1-indexed) each time a retry is about to happen. Use it for structured logging, metrics, or alerting.
+
+```typescript
+await retryAsync(fn, {
+  attempts: 4,
+  onRetry: (err, attempt) => {
+    logger.warn({
+      event: 'retry_attempt',
+      attempt,
+      error: err.message,
+      nextDelayMs: 1000 * Math.pow(2, attempt - 1),
+    });
+  },
+});
+```
+
+## Jitter to prevent thundering herd
+
+When many clients retry at the same intervals (e.g., after a service restart), they synchronize and overwhelm the recovering service. Setting `jitter: true` multiplies each calculated delay by a random factor between 0.5 and 1.5, spreading retries across the time window.
+
+```typescript
+await retryAsync(fn, {
+  attempts: 5,
+  delay: 1000,
+  backoff: 'exponential',
+  jitter: true,
+  // Actual delays are random within:
+  // attempt 1: 500–1500ms
+  // attempt 2: 1000–3000ms
+  // attempt 3: 2000–6000ms
+});
+```
+
+## Cancellation with `AbortSignal`
+
+Pass an `AbortSignal` to cancel the retry loop mid-flight. If the signal is already aborted when `retryAsync` is called, it throws `RetryAbortedError` immediately. If aborted during a sleep, it throws without waiting for the next attempt.
+
+```typescript
+import { retryAsync, RetryAbortedError } from '@deessejs/fp';
+
+const controller = new AbortController();
+
+// Cancel after 5 seconds
+setTimeout(() => controller.abort(), 5_000);
+
+try {
+  const result = await retryAsync(
+    () => fetchData(),
+    { attempts: 10, delay: 1000, signal: controller.signal },
+  );
+} catch (err) {
+  if (err instanceof RetryAbortedError) {
+    console.log('Retry cancelled by signal');
+  }
+}
+```
+
+## Real-world example: resilient API client
+
+```typescript
+import { retryAsync } from '@deessejs/fp';
+
+interface ApiClientOptions {
+  baseUrl: string;
+  timeout?: number;
+}
+
+const createResilientFetch = ({ baseUrl, timeout = 5_000 }: ApiClientOptions) => {
+  return async <T>(path: string, init?: RequestInit): Promise<T> => {
+    return retryAsync(
+      async () => {
+        const res = await fetch(`${baseUrl}${path}`, {
+          ...init,
+          signal: AbortSignal.timeout(timeout),
+        });
+
+        if (res.status === 429) {
+          // Respect Retry-After header
+          const retryAfter = Number(res.headers.get('Retry-After') ?? 1) * 1000;
+          await new Promise(r => setTimeout(r, retryAfter));
+          throw new Error('HTTP 429 rate limited');
+        }
+
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json() as T;
+      },
+      {
+        attempts: 3,
+        delay: 500,
+        backoff: 'exponential',
+        jitter: true,
+        maxDelay: 10_000,
+        predicate: err => !err.message.match(/HTTP 4[^2]|HTTP 42[^9]/),
+        onRetry: (err, attempt) =>
+          console.warn(`[fetch] attempt ${attempt} failed: ${err.message}`),
+      },
+    );
+  };
+};
+
+const api = createResilientFetch({ baseUrl: 'https://api.example.com' });
+const user = await api<User>('/users/42');
+```
+
+<CardGroup cols={2}>
+  <Card title="Sleep" href="/utilities/sleep">
+    Delay, timeout, and cancellable sleep utilities
+  </Card>
+  <Card title="Pipe & Flow" href="/utilities/pipe-flow">
+    Compose retry logic into readable pipelines
+  </Card>
+  <Card title="AsyncResult" href="/core/async-result">
+    Async operations with typed error handling
+  </Card>
+  <Card title="Resilience patterns" href="/examples/resilience">
+    End-to-end examples combining retry, timeout, and fallback
+  </Card>
+</CardGroup>

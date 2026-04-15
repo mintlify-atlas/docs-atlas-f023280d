@@ -1,0 +1,387 @@
+---
+title: "Structured error types with validation and context"
+description: "Define typed domain errors with Zod validation, contextual notes, and cause chaining. Replace generic Error strings with structured, inspectable error objects."
+---
+
+The error system gives every failure a name, typed arguments, contextual notes, and an optional cause chain. Instead of throwing bare `new Error('something went wrong')` strings, you define error types once at module level and instantiate them with structured data that stays attached through every transformation.
+
+## Why structured errors?
+
+A plain `Error` object carries only a message string. By the time it surfaces in a catch block or a `Result.err`, that string is the only clue you have. Structured errors change the contract: the `name` identifies the failure type exactly, `args` carries the domain data that caused the failure, `notes` accumulate context added by callers higher up the stack, and `cause` preserves the original error when one failure wraps another.
+
+```typescript
+// Before: opaque strings force string-parsing to classify errors
+throw new Error(`User ${id} not found`);
+
+// After: name + args are machine-readable; notes explain call-site context
+import { error } from '@deessejs/fp';
+import { z } from 'zod';
+
+const NotFoundError = error({
+  name: 'NotFoundError',
+  schema: z.object({ id: z.number() }),
+});
+
+throw NotFoundError({ id: 42 });
+// { name: 'NotFoundError', args: { id: 42 }, notes: [], cause: None }
+```
+
+<Note>
+`Error<T>` is a plain object — it does **not** carry `Result` methods. Wrap it with `err()` from the Result module to get `Result<never, Error<T>>` for pipeline composition.
+</Note>
+
+## API reference
+
+### `error(options)` — define an error type
+
+`error()` is a factory factory: it accepts an `ErrorOptions` object and returns an `ErrorBuilder<T>` — a callable that creates `Error<T>` instances.
+
+<ParamField body="name" type="string" required>
+  Unique string identifier for this error type. Used in discriminated unions and `filterErrorsByName`.
+</ParamField>
+
+<ParamField body="schema" type="ZodSchema<T>">
+  Optional Zod schema. When provided, args are validated at construction time. Invalid args produce a `${name}ValidationError` instead of the intended error.
+</ParamField>
+
+<ParamField body="message" type="(args: T) => string">
+  Optional custom message factory. Defaults to `"${name}: ${JSON.stringify(args)}"`. Sensitive fields (`password`, `token`, `secret`, etc.) are automatically redacted from the default message.
+</ParamField>
+
+<Tabs>
+  <Tab title="With Zod schema">
+    ```typescript
+    import { error } from '@deessejs/fp';
+    import { z } from 'zod';
+
+    const SizeError = error({
+      name: 'SizeError',
+      schema: z.object({
+        current: z.number(),
+        wanted: z.number(),
+      }),
+    });
+
+    const e = SizeError({ current: 3, wanted: 5 });
+    // e.name  → 'SizeError'
+    // e.args  → { current: 3, wanted: 5 }
+    // e.notes → []
+    // e.cause → None
+
+    // Invalid args produce a validation error
+    const bad = SizeError({ current: 'oops', wanted: 5 });
+    // bad.name → 'SizeErrorValidationError'
+    ```
+  </Tab>
+  <Tab title="Without schema">
+    ```typescript
+    import { error } from '@deessejs/fp';
+
+    // Without schema: pass args type via the generic parameter
+    const AuthError = error<{ reason: string }>({ name: 'AuthError' });
+
+    // Or use the type-cast pattern for structured args
+    const NetworkError = error({
+      name: 'NetworkError',
+    });
+
+    const e = AuthError({ reason: 'token_expired' });
+    ```
+  </Tab>
+  <Tab title="Custom message">
+    ```typescript
+    import { error } from '@deessejs/fp';
+    import { z } from 'zod';
+
+    const QuotaError = error({
+      name: 'QuotaError',
+      schema: z.object({ used: z.number(), limit: z.number() }),
+      message: ({ used, limit }) =>
+        `Quota exceeded: ${used}/${limit} requests used`,
+    });
+
+    const e = QuotaError({ used: 105, limit: 100 });
+    // e.message → 'Quota exceeded: 105/100 requests used'
+    ```
+  </Tab>
+</Tabs>
+
+### `Error<T>` structure
+
+```typescript
+interface Error<T> {
+  readonly name: string;               // Error type identifier
+  readonly args: T;                    // Typed domain data
+  readonly notes: readonly string[];   // Accumulated context
+  readonly cause: Maybe<NativeError>;  // Chained previous error
+  readonly message: string;            // Human-readable description
+  readonly stack?: string;             // Captured call stack
+
+  addNotes(...notes: string[]): Error<T>;
+  from(cause: Error | Maybe<Error>): Error<T>;
+}
+```
+
+### `.addNotes(...notes)` — attach context
+
+Returns a new `Error<T>` with additional notes appended. Notes are immutable — each call creates a new object.
+
+```typescript
+const e = NotFoundError({ id: 42 })
+  .addNotes('Called from UserService.getById')
+  .addNotes('Request origin: POST /checkout');
+
+// e.notes → [
+//   'Called from UserService.getById',
+//   'Request origin: POST /checkout'
+// ]
+```
+
+### `.from(cause)` — chain errors
+
+Links a cause to the error, preserving the original failure for debugging. Accepts an `Error<T>`, `Some<Error>`, or `Err<Error>`.
+
+```typescript
+const dbError = ConnectionError({ host: 'db.internal' });
+
+const serviceError = ServiceError({ operation: 'createUser' })
+  .from(dbError);
+
+// serviceError.cause → Some(dbError)
+```
+
+### `exceptionGroup(errors)` — group multiple errors
+
+Wraps an array of errors into a single `ErrorGroup` with `name: 'ExceptionGroup'`. Useful when validating multiple fields or running parallel operations that each produce independent failures. Nested `ErrorGroup` instances are automatically flattened.
+
+```typescript
+import { error, exceptionGroup } from '@deessejs/fp';
+
+const group = exceptionGroup([
+  ValidationError({ field: 'email', message: 'invalid format' }),
+  ValidationError({ field: 'age', message: 'must be positive' }),
+]);
+
+// group.name       → 'ExceptionGroup'
+// group.exceptions → [ValidationError, ValidationError]
+// group.message    → 'ExceptionGroup: 2 errors'
+```
+
+### `raise(error)` — functional throw returning `never`
+
+`raise` throws the given error and is typed as returning `never`. Use it inside functions that return `Result` to exit early without needing a `return` statement — the `never` return type is assignable to any `Result<T, E>` type.
+
+<Warning>
+`raise` actually **throws** the error — it does not return an `Err`. This is a deliberate choice for early-exit ergonomics. If you are in an `attempt()` or `fromPromise()` context, the throw will be caught and wrapped. In a plain synchronous function, the caller must wrap the call in `attempt()` to benefit from typed error handling.
+</Warning>
+
+```typescript
+import { ok, raise } from '@deessejs/fp';
+
+const divide = (a: number, b: number) => {
+  if (b === 0) raise(DivisionError({ numerator: a }));  // throws — never returns
+  return ok(a / b);
+};
+```
+
+### `isError(value)` — type guard
+
+```typescript
+import { isError } from '@deessejs/fp';
+
+isError(SizeError({ current: 3, wanted: 5 })); // true
+isError(new Error('native'));                    // false — no `args` or `notes`
+isError('string');                               // false
+```
+
+### `isErrorGroup(value)` — type guard
+
+```typescript
+import { isErrorGroup } from '@deessejs/fp';
+
+const group = exceptionGroup([SizeError({ current: 1, wanted: 2 })]);
+isErrorGroup(group);          // true
+isErrorGroup(SizeError(...)); // false
+```
+
+### `getErrorMessage(error)` — human-readable string
+
+Returns the error's `.message` for a plain `Error<T>`, or a summary for an `ErrorGroup`.
+
+```typescript
+import { getErrorMessage } from '@deessejs/fp';
+
+getErrorMessage(SizeError({ current: 3, wanted: 5 }));
+// 'SizeError: {"current":3,"wanted":5}'
+
+getErrorMessage(exceptionGroup([e1, e2]));
+// 'ExceptionGroup: 2 error(s)'
+```
+
+### `flattenErrorGroup(error)` — flatten nested groups
+
+Returns all leaf `Error<T>` instances in a flat array, recursively unwrapping any nested `ErrorGroup`.
+
+```typescript
+import { flattenErrorGroup, exceptionGroup } from '@deessejs/fp';
+
+const inner = exceptionGroup([SizeError({ current: 1, wanted: 2 })]);
+const outer = exceptionGroup([inner, AuthError({ reason: 'expired' })]);
+
+flattenErrorGroup(outer);
+// [SizeError, AuthError]
+```
+
+### `filterErrorsByName(group, name)` — filter by type
+
+```typescript
+import { filterErrorsByName } from '@deessejs/fp';
+
+const group = exceptionGroup([
+  ValidationError({ field: 'email', message: 'invalid' }),
+  ValidationError({ field: 'name', message: 'required' }),
+  NetworkError({ host: 'api.example.com' }),
+]);
+
+filterErrorsByName(group, 'ValidationError');
+// [ValidationError(email), ValidationError(name)]
+```
+
+## Real-world example
+
+Define errors once per module, use them throughout. The compiler enforces that every error carries the right shape of data.
+
+```typescript
+// errors/user.ts
+import { error } from '@deessejs/fp';
+import { z } from 'zod';
+
+export const UserNotFoundError = error({
+  name: 'UserNotFoundError',
+  schema: z.object({ id: z.string().uuid() }),
+  message: ({ id }) => `User ${id} does not exist`,
+});
+
+export const UserSuspendedError = error({
+  name: 'UserSuspendedError',
+  schema: z.object({ id: z.string().uuid(), reason: z.string() }),
+});
+
+export const UserErrors = { UserNotFoundError, UserSuspendedError };
+```
+
+```typescript
+// services/user.ts
+import { ok, err, pipe } from '@deessejs/fp';
+import { UserNotFoundError, UserSuspendedError } from './errors/user';
+
+const getActiveUser = (id: string) => {
+  const row = db.users.findById(id);
+  if (!row) return err(UserNotFoundError({ id }));
+  if (row.suspended) return err(UserSuspendedError({ id, reason: row.suspendReason }));
+  return ok(row);
+};
+
+const result = getActiveUser('abc-123');
+
+// Narrow on error name — TypeScript knows the args shape
+if (!result.ok) {
+  switch (result.error.name) {
+    case 'UserNotFoundError':
+      return respond(404, `User ${result.error.args.id} not found`);
+    case 'UserSuspendedError':
+      return respond(403, result.error.args.reason);
+  }
+}
+```
+
+## Zod validation example
+
+Zod schemas catch malformed error construction at runtime — useful when args come from untrusted sources like API responses.
+
+```typescript
+import { error } from '@deessejs/fp';
+import { z } from 'zod';
+
+const PaymentError = error({
+  name: 'PaymentError',
+  schema: z.object({
+    amount: z.number().positive(),
+    currency: z.enum(['USD', 'EUR', 'GBP']),
+    code: z.string().length(4),
+  }),
+});
+
+// Valid — produces PaymentError
+PaymentError({ amount: 99.99, currency: 'USD', code: 'E403' });
+
+// Invalid — produces PaymentErrorValidationError
+PaymentError({ amount: -1, currency: 'XYZ', code: 'toolong' });
+// name: 'PaymentErrorValidationError'
+// notes: ['Invalid enum value...', 'String must contain exactly 4 character(s)']
+```
+
+## Best practices
+
+<AccordionGroup>
+  <Accordion title="Define errors at module level">
+    Export error builders from a dedicated `errors.ts` file. This avoids recreating the builder on every call and makes your domain's failure vocabulary easy to discover.
+
+    ```typescript
+    // errors.ts
+    export const NotFoundError = error({ name: 'NotFoundError', ... });
+    export const ConflictError = error({ name: 'ConflictError', ... });
+    ```
+  </Accordion>
+
+  <Accordion title="Use discriminated unions for exhaustive handling">
+    Because `error.name` is a string literal, TypeScript can narrow the `args` type in a `switch`:
+
+    ```typescript
+    const handleError = (e: NotFoundError | ConflictError) => {
+      switch (e.name) {
+        case 'NotFoundError': return respond(404, e.args.id);
+        case 'ConflictError': return respond(409, e.args.field);
+      }
+    };
+    ```
+  </Accordion>
+
+  <Accordion title="Add notes at each layer, not all at once">
+    Each layer should add only the context it knows. Avoid passing a giant note string from a deep utility back up — add notes as the error bubbles through your call stack.
+
+    ```typescript
+    // repository layer
+    const repoErr = DbError({ table: 'users' });
+
+    // service layer adds its context
+    return err(repoErr.addNotes('UserService.create failed'));
+
+    // handler adds request context
+    return err(repoErr.addNotes(`Request: POST /users, body: ${JSON.stringify(req.body)}`));
+    ```
+  </Accordion>
+
+  <Accordion title="Prefer err() over raise() in pure functions">
+    `raise()` throws, which breaks referential transparency. Use `err()` to return failures explicitly. Reserve `raise()` for guard clauses inside callbacks where returning `err()` would require a cast.
+  </Accordion>
+
+  <Accordion title="Never put secrets in args">
+    The `args` object is serialized into the default `message` and may appear in logs. The builder automatically redacts fields named `password`, `token`, `secret`, `apiKey`, and similar. Avoid passing raw credential values as error args.
+  </Accordion>
+</AccordionGroup>
+
+<CardGroup cols={2}>
+  <Card title="Result" href="/core/result">
+    Wrap errors in `Ok`/`Err` for pipeline composition
+  </Card>
+  <Card title="Conversions" href="/utilities/conversions">
+    Convert between Result, Maybe, and nullable types
+  </Card>
+  <Card title="Pipe & Flow" href="/utilities/pipe-flow">
+    Compose transformations that carry structured errors
+  </Card>
+  <Card title="Error handling patterns" href="/guides/error-handling-patterns">
+    Patterns for layered error handling in real applications
+  </Card>
+</CardGroup>

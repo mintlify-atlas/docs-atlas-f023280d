@@ -1,0 +1,399 @@
+---
+title: "Migrate from try/catch to Result and Maybe"
+description: "Step-by-step guide for replacing try/catch with Result and Maybe. Covers JSON parsing, fetch, database queries, and validation with before/after examples."
+keywords: ["migration", "try/catch", "Result", "Maybe", "attempt", "TypeScript", "exceptions"]
+---
+
+Thrown exceptions work, but they have a fundamental problem: they are invisible in the type system. A function that can throw `SyntaxError` or `NetworkError` has the same signature as one that cannot. TypeScript cannot tell the difference, and callers cannot tell without reading the implementation.
+
+Migrating to `Result` and `Maybe` does not mean eliminating all exceptions—it means making failures explicit where they matter. Once an error appears in a function's return type, TypeScript enforces that every caller handles it. Bugs caused by unhandled failures become compile errors instead of production incidents.
+
+<Note>
+You do not need to migrate everything at once. `attempt()` and `resultFromThrowable()` act as bridges that let you introduce `Result` gradually while leaving the rest of the codebase unchanged.
+</Note>
+
+## Migration steps
+
+<Steps>
+  <Step title="Identify functions that throw">
+    Start by finding the functions you call most frequently that can throw. Prioritize:
+    - JSON parsing (`JSON.parse`)
+    - HTTP fetches (`fetch`, `axios`)
+    - Database queries
+    - File system operations
+    - Input validation that throws
+
+    Search for `throw new`, `JSON.parse(`, and `await fetch(` as a starting point.
+  </Step>
+
+  <Step title="Wrap them with attempt() (Try)">
+    Before defining your own error types, use `attempt()` as a drop-in wrapper. It converts any thrown exception into a `Try<T, Error>`.
+
+    ```typescript
+    import { attempt } from '@deessejs/fp';
+
+    // Before
+    const data = JSON.parse(input); // can throw SyntaxError
+
+    // After: no try/catch needed
+    const result = attempt(() => JSON.parse(input));
+    // Type: Try<unknown, Error>
+
+    if (result.ok) {
+      console.log(result.value);
+    } else {
+      console.error(result.error.message);
+    }
+    ```
+
+    This is the lowest-friction first step. You have not changed any types yet—you have just made the failure visible.
+  </Step>
+
+  <Step title="Define explicit error types">
+    Replace `Error` with a discriminated union that describes every way the operation can fail. This is where the real value appears: callers can now `switch` on the error type exhaustively.
+
+    ```typescript
+    type ParseError =
+      | { type: 'invalid_json'; input: string }
+      | { type: 'wrong_shape'; received: unknown };
+
+    type NetworkError =
+      | { type: 'not_found'; url: string }
+      | { type: 'server_error'; statusCode: number }
+      | { type: 'network_failure'; message: string };
+    ```
+  </Step>
+
+  <Step title="Replace try/catch return with Result">
+    Rewrite the function to return `Result<T, YourError>` using `ok` and `err`.
+
+    ```typescript
+    import { ok, err, Result } from '@deessejs/fp';
+
+    // Before
+    function parseUser(json: string): User {
+      const obj = JSON.parse(json); // throws
+      if (!obj.id) throw new Error('Missing id');
+      return obj;
+    }
+
+    // After
+    function parseUser(json: string): Result<User, ParseError> {
+      let obj: unknown;
+      try {
+        obj = JSON.parse(json);
+      } catch {
+        return err({ type: 'invalid_json', input: json });
+      }
+
+      if (!isUser(obj)) {
+        return err({ type: 'wrong_shape', received: obj });
+      }
+
+      return ok(obj);
+    }
+    ```
+  </Step>
+
+  <Step title="Update callers to use isOk / matchResult">
+    Replace `try/catch` at every call site with `isOk`/`isErr` guards or `matchResult`.
+
+    ```typescript
+    import { isOk, matchResult } from '@deessejs/fp';
+
+    // Guard style
+    const result = parseUser(rawJson);
+    if (isOk(result)) {
+      renderProfile(result.value);
+    } else {
+      showError(result.error);
+    }
+
+    // Match style (preferred for exhaustive handling)
+    const html = matchResult(
+      parseUser(rawJson),
+      (user) => `<h1>${user.name}</h1>`,
+      (error) => {
+        switch (error.type) {
+          case 'invalid_json': return `<p>Invalid data received</p>`;
+          case 'wrong_shape': return `<p>Unexpected data format</p>`;
+        }
+      }
+    );
+    ```
+  </Step>
+</Steps>
+
+## Before and after: common patterns
+
+### JSON.parse
+
+<Tabs>
+  <Tab title="Before">
+    ```typescript
+    function parseConfig(json: string): AppConfig {
+      try {
+        return JSON.parse(json) as AppConfig;
+      } catch (e) {
+        throw new Error(`Invalid config: ${e.message}`);
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="After">
+    ```typescript
+    import { attempt, mapTry, Result, ok, err } from '@deessejs/fp';
+
+    type ConfigError = { type: 'invalid_json'; message: string };
+
+    function parseConfig(json: string): Result<AppConfig, ConfigError> {
+      return matchTry(
+        attempt(() => JSON.parse(json) as AppConfig),
+        (config) => ok(config),
+        (error) => err({ type: 'invalid_json', message: error.message })
+      );
+    }
+    ```
+  </Tab>
+  <Tab title="One-liner">
+    ```typescript
+    import { resultFromThrowable } from '@deessejs/fp';
+
+    // resultFromThrowable wraps attempt + error mapping in one call
+    const parseConfig = (json: string) =>
+      resultFromThrowable(
+        () => JSON.parse(json) as AppConfig,
+        (e) => ({ type: 'invalid_json' as const, message: (e as Error).message })
+      );
+    ```
+  </Tab>
+</Tabs>
+
+### fetch + .json()
+
+<Tabs>
+  <Tab title="Before">
+    ```typescript
+    async function getUser(id: number): Promise<User> {
+      const res = await fetch(`/api/users/${id}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json();
+    }
+    ```
+  </Tab>
+  <Tab title="After">
+    ```typescript
+    import { fromPromise, mapErrAsyncResult } from '@deessejs/fp';
+
+    type UserError =
+      | { type: 'not_found'; id: number }
+      | { type: 'network'; statusCode: number };
+
+    const getUser = (id: number) =>
+      fromPromise(
+        fetch(`/api/users/${id}`).then(async (res) => {
+          if (res.status === 404)
+            throw Object.assign(new Error('Not found'), { status: 404 });
+          if (!res.ok)
+            throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
+          return res.json() as Promise<User>;
+        })
+      ).then((r) =>
+        mapErrAsyncResult(r, (e: Error & { status?: number }) =>
+          e.status === 404
+            ? ({ type: 'not_found', id } as UserError)
+            : ({ type: 'network', statusCode: e.status ?? 0 } as UserError)
+        )
+      );
+    ```
+  </Tab>
+</Tabs>
+
+### Database query
+
+<Tabs>
+  <Tab title="Before">
+    ```typescript
+    async function findUser(id: number): Promise<User | null> {
+      try {
+        const user = await db.users.findUnique({ where: { id } });
+        return user;
+      } catch (e) {
+        console.error('DB error', e);
+        return null;
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="After">
+    ```typescript
+    import { fromPromise, fromNullable, toResultMaybe, flatMapAsyncResult } from '@deessejs/fp';
+
+    type DbError =
+      | { type: 'not_found'; id: number }
+      | { type: 'db_error'; message: string };
+
+    const findUser = (id: number) =>
+      fromPromise(db.users.findUnique({ where: { id } }))
+        .then((r) =>
+          mapErrAsyncResult(r, (e) => ({
+            type: 'db_error' as const,
+            message: e.message,
+          }))
+        )
+        .then((r) =>
+          flatMapAsyncResult(r, (maybeUser) => {
+            const result = toResultMaybe(
+              fromNullable(maybeUser),
+              { type: 'not_found' as const, id }
+            );
+            return Promise.resolve(result);
+          })
+        );
+    ```
+  </Tab>
+</Tabs>
+
+### Input validation
+
+<Tabs>
+  <Tab title="Before">
+    ```typescript
+    function validateAge(age: number): number {
+      if (age < 0) throw new Error('Age must be positive');
+      if (age > 150) throw new Error('Age is unrealistic');
+      return age;
+    }
+    ```
+  </Tab>
+  <Tab title="After">
+    ```typescript
+    import { ok, err, Result } from '@deessejs/fp';
+
+    type AgeError = { type: 'invalid_age'; reason: string; received: number };
+
+    const validateAge = (age: number): Result<number, AgeError> => {
+      if (age < 0) return err({ type: 'invalid_age', reason: 'must be positive', received: age });
+      if (age > 150) return err({ type: 'invalid_age', reason: 'unrealistic value', received: age });
+      return ok(age);
+    };
+    ```
+  </Tab>
+</Tabs>
+
+## Migration tips
+
+**Start at the leaves, work toward the root.** The most-called utility functions (parsers, validators, formatters) are the best starting point. Migrate them first, and the type system will propagate `Result` upward naturally as you update callers.
+
+**Use `attempt()` as a bridge for code you cannot change.** Any third-party function that throws can be wrapped with `attempt()` at the call site. You get a `Try<T, Error>` immediately, which you can convert to your own `Result` type with `matchTry` or `mapTry`.
+
+```typescript
+import { attempt, matchTry, ok, err } from '@deessejs/fp';
+
+// legacy third-party parser that throws
+const parseLegacy = (input: string): MyData => thirdPartyLib.parse(input);
+
+type ParseError = { type: 'parse_failed'; message: string };
+
+const safeParseLegacy = (input: string): Result<MyData, ParseError> =>
+  matchTry(
+    attempt(() => parseLegacy(input)),
+    (data) => ok(data),
+    (error) => err({ type: 'parse_failed', message: error.message })
+  );
+```
+
+**Use `resultFromThrowable()` for one-liners.** When the mapping from `Error` to your error type is simple, `resultFromThrowable` combines `attempt` and the error mapping in a single call.
+
+```typescript
+import { resultFromThrowable } from '@deessejs/fp';
+
+const safeParse = (json: string) =>
+  resultFromThrowable(
+    () => JSON.parse(json),
+    (e) => ({ type: 'parse_error' as const, message: (e as Error).message })
+  );
+```
+
+## FAQ
+
+<AccordionGroup>
+  <Accordion title="What about third-party libs that throw?">
+    Wrap the call with `attempt()` at the boundary where you call it, then use `matchTry` or `mapTry` to convert the generic `Error` into your domain error type. This keeps the foreign exception contained within a single function and exposes only your typed `Result` to the rest of the codebase.
+
+    ```typescript
+    import { attempt, matchTry, ok, err } from '@deessejs/fp';
+
+    type YamlError = { type: 'yaml_parse'; message: string };
+
+    const parseYaml = (input: string): Result<object, YamlError> =>
+      matchTry(
+        attempt(() => yaml.parse(input)),
+        (data) => ok(data),
+        (e) => err({ type: 'yaml_parse', message: e.message })
+      );
+    ```
+  </Accordion>
+
+  <Accordion title="What if I need a stack trace?">
+    Stack traces are preserved on the `Error` object returned by `attempt()`. The `TryFailure` value's `.error` property is a standard `Error` instance with a `.stack` property.
+
+    ```typescript
+    import { attempt, isTryErr } from '@deessejs/fp';
+
+    const result = attempt(() => riskyOperation());
+
+    if (isTryErr(result)) {
+      console.error(result.error.stack); // full stack trace
+    }
+    ```
+
+    If you need a stack trace on your custom domain errors, use the `error()` builder from the error system, which captures the stack at the call site automatically.
+  </Accordion>
+
+  <Accordion title="How do I handle unknown errors?">
+    `attempt()` and `fromPromise()` always wrap non-`Error` throws in a real `Error` object. If you throw a string or plain object, it becomes `Error('string value')` or `Error('[object Object]')`. To preserve structured error data from non-standard throws, pass a custom error mapper:
+
+    ```typescript
+    import { resultFromThrowable } from '@deessejs/fp';
+
+    const result = resultFromThrowable(
+      () => externalLib.doSomething(),
+      (thrown) => {
+        if (thrown instanceof Error) {
+          return { type: 'known' as const, message: thrown.message };
+        }
+        // Handle non-Error throws
+        return { type: 'unknown' as const, raw: String(thrown) };
+      }
+    );
+    ```
+
+    For async code, wrap the promise manually if you need to preserve non-`Error` rejections:
+
+    ```typescript
+    const fromPromiseCustom = <T, E>(
+      promise: Promise<T>,
+      onError: (thrown: unknown) => E
+    ): Promise<Result<T, E>> =>
+      promise
+        .then((v) => ok<T, E>(v))
+        .catch((e) => err<T, E>(onError(e)));
+    ```
+  </Accordion>
+</AccordionGroup>
+
+<CardGroup cols={2}>
+  <Card title="Error handling patterns" icon="shield" href="/guides/error-handling-patterns">
+    Patterns for Result, Maybe, and the error system.
+  </Card>
+  <Card title="Async patterns" icon="bolt" href="/guides/async-patterns">
+    Wrap fetch, chain operations, retry, and cancel with AsyncResult.
+  </Card>
+  <Card title="Try reference" icon="book" href="/core/try">
+    Full API for attempt and Try.
+  </Card>
+  <Card title="Result reference" icon="circle-check" href="/core/result">
+    Full API for ok, err, matchResult, and friends.
+  </Card>
+</CardGroup>

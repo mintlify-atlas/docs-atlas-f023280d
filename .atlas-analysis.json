@@ -1,0 +1,97 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "@deessejs/fp",
+  "projectDescription": "Zero-dependency TypeScript library providing functional programming primitives — Result, Maybe, Try, and AsyncResult monads — for bulletproof, type-safe error handling.",
+  "theme": "luma",
+  "primaryColor": "#848484",
+  "lightColor": "#0d0d0d",
+  "darkColor": "#d3d3d4",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Types",
+            "pages": [
+              "core/result",
+              "core/maybe",
+              "core/try",
+              "core/async-result"
+            ]
+          },
+          {
+            "group": "Utilities",
+            "pages": [
+              "utilities/error-system",
+              "utilities/conversions",
+              "utilities/pipe-flow",
+              "utilities/retry",
+              "utilities/sleep"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/error-handling-patterns",
+              "guides/async-patterns",
+              "guides/migrating-from-exceptions"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Examples",
+        "groups": [
+          {
+            "group": "Common Patterns",
+            "pages": [
+              "examples/form-validation",
+              "examples/http-api",
+              "examples/database",
+              "examples/resilience"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Result<T, E> monad for explicit, type-safe error handling",
+    "Maybe<T> monad as a safe alternative to null/undefined",
+    "Try type for wrapping functions that throw exceptions",
+    "AsyncResult for promise-based async error handling",
+    "Structured error system with Zod validation, notes, and chaining",
+    "Retry utilities with exponential, linear, and constant backoff strategies",
+    "Sleep and timeout utilities for async workflows",
+    "Pipe and flow composition helpers",
+    "Zero runtime dependencies (Zod optional for error schemas)",
+    "Full TypeScript 5.0+ support with perfect type inference"
+  ],
+  "publicApiSurface": [
+    "ok(value) / err(error) — Result constructors",
+    "isOk(result) / isErr(result) — Result type guards",
+    "mapResult / flatMapResult / mapErr — Result transformations",
+    "matchResult / tapResult — Result utilities",
+    "some(value) / none() / fromNullable(value) — Maybe constructors",
+    "isSome(maybe) / isNone(maybe) — Maybe type guards",
+    "mapMaybe / flatMapMaybe — Maybe transformations",
+    "attempt(fn) / attemptAsync(fn) — Try constructors",
+    "okAsync / errAsync / fromPromise — AsyncResult constructors",
+    "all / allSettled / race / traverse — AsyncResult combinators",
+    "error(options) — Structured error factory",
+    "exceptionGroup(errors) — Error grouping",
+    "retryAsync(fn, options) — Retry with backoff",
+    "sleep(ms) / withTimeout(promise, ms) — Timing utilities",
+    "pipe / flow / pipeAsync / flowAsync — Composition helpers",
+    "toResult / fromMaybe / toMaybeFromResult — Type conversions"
+  ]
+}

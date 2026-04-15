@@ -1,97 +1,100 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "@deessejs/fp: Type-safe monads for TypeScript"
+description: "Zero-dependency functional programming primitives for TypeScript. Result, Maybe, Try, and AsyncResult monads that make error handling explicit and bulletproof."
 ---
 
-## Setting up
+`@deessejs/fp` brings functional programming primitives to TypeScript — without the learning curve of heavy FP libraries. Handle errors explicitly using `Result`, represent optional values with `Maybe`, wrap throwing code with `Try`, and chain async operations with `AsyncResult`. Every type integrates seamlessly with TypeScript's type system, giving you compile-time guarantees that errors are always handled.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get from install to working code in under five minutes
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Installation" icon="box" href="/installation">
+    Install for npm, pnpm, yarn, and configure TypeScript
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Result type" icon="circle-check" href="/core/result">
+    Explicit, type-safe error handling without exceptions
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Maybe type" icon="circle-question" href="/core/maybe">
+    Safe alternative to null and undefined
   </Card>
-</Columns>
+  <Card title="AsyncResult" icon="bolt" href="/core/async-result">
+    Chain async operations with full error safety
+  </Card>
+  <Card title="Examples" icon="code" href="/examples/http-api">
+    Real-world patterns for APIs, forms, and databases
+  </Card>
+</CardGroup>
 
-## Create beautiful pages
+## Why @deessejs/fp?
 
-Everything you need to create world-class documentation.
+TypeScript's type system is powerful — but traditional error handling with `try/catch` punches holes in it. When a function can throw, callers have no idea. When `null` can appear, runtime crashes follow.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+`@deessejs/fp` makes errors and optional values **part of the type**, so TypeScript can enforce they're always handled.
 
-## Need inspiration?
+<CardGroup cols={2}>
+  <Card title="Try type" icon="shield" href="/core/try">
+    Wrap any throwing function into a typed result
+  </Card>
+  <Card title="Error system" icon="triangle-exclamation" href="/utilities/error-system">
+    Structured errors with context, chaining, and grouping
+  </Card>
+  <Card title="Retry utilities" icon="arrows-rotate" href="/utilities/retry">
+    Resilience patterns with exponential backoff and jitter
+  </Card>
+  <Card title="Guides" icon="book" href="/guides/error-handling-patterns">
+    Patterns for real-world TypeScript applications
+  </Card>
+</CardGroup>
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+## Quick look
+
+```typescript
+import { ok, err, isOk, Result } from '@deessejs/fp'
+
+class NotFoundError extends Error {
+  constructor(public id: number) {
+    super(`User ${id} not found`)
+    this.name = 'NotFoundError'
+  }
+}
+class UnauthorizedError extends Error {
+  constructor() { super('Unauthorized'); this.name = 'UnauthorizedError' }
+}
+
+type UserError = NotFoundError | UnauthorizedError
+
+interface User { id: number; name: string }
+
+function getUser(id: number): Result<User, UserError> {
+  if (id <= 0) return err(new NotFoundError(id))
+  return ok({ id, name: 'Alice' })
+}
+
+const result = getUser(1)
+
+if (isOk(result)) {
+  console.log(result.value.name) // TypeScript knows this is User
+} else {
+  console.error(result.error.message) // TypeScript knows this is UserError
+}
+```
+
+<Steps>
+  <Step title="Install the package">
+    ```bash
+    npm install @deessejs/fp
+    ```
+  </Step>
+  <Step title="Import what you need">
+    ```typescript
+    import { ok, err, isOk, Result } from '@deessejs/fp'
+    ```
+  </Step>
+  <Step title="Replace try/catch with Result">
+    Return `ok(value)` for success and `err(error)` for failure — TypeScript enforces handling both.
+  </Step>
+  <Step title="Chain operations safely">
+    Use `mapResult`, `flatMapResult`, and `matchResult` to transform and compose results without losing type safety.
+  </Step>
+</Steps>
